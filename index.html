@@ -1,0 +1,810 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>🛒 הסל שלנו</title>
+<link href="https://fonts.googleapis.com/css2?family=Rubik:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+  import { getDatabase, ref, set, onValue } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyDug3fqhFWzZVE_tTw1ee1RFOdsARlRqNc",
+    authDomain: "grocery-list-dbbdd.firebaseapp.com",
+    databaseURL: "https://grocery-list-dbbdd-default-rtdb.firebaseio.com",
+    projectId: "grocery-list-dbbdd",
+    storageBucket: "grocery-list-dbbdd.firebasestorage.app",
+    messagingSenderId: "1079059037973",
+    appId: "1:1079059037973:web:0d281a9fcea0b227f6b31c"
+  };
+
+  let db = null;
+
+  function getWeekKey(date = new Date()) {
+    const d = new Date(date);
+    d.setHours(0,0,0,0);
+    d.setDate(d.getDate() - d.getDay());
+    return `week_${d.getFullYear()}_${String(d.getMonth()+1).padStart(2,'0')}_${String(d.getDate()).padStart(2,'0')}`;
+  }
+
+  function getWeekLabel(key) {
+    const parts = key.replace('week_','').split('_');
+    const d = new Date(parseInt(parts[0]), parseInt(parts[1])-1, parseInt(parts[2]));
+    const end = new Date(d); end.setDate(d.getDate()+6);
+    const fmt = dt => `${dt.getDate()}/${dt.getMonth()+1}/${dt.getFullYear()}`;
+    return `${fmt(d)} – ${fmt(end)}`;
+  }
+
+  window.APP = {
+    db: null,
+    currentWeek: null,
+    items: {},
+    stats: {},
+
+    async init() {
+      this.currentWeek = getWeekKey();
+      try {
+        const app = initializeApp(firebaseConfig);
+        db = getDatabase(app);
+        this.db = db;
+        this.listenToData();
+        document.getElementById('sync-badge').textContent = '☁️ מסונכרן';
+        document.getElementById('sync-badge').className = 'sync-badge online';
+      } catch(e) {
+        this.loadLocal();
+        document.getElementById('sync-badge').textContent = '💾 מקומי';
+        document.getElementById('sync-badge').className = 'sync-badge offline';
+      }
+      this.renderWeekSelector();
+    },
+
+    listenToData() {
+      onValue(ref(db, '/'), (snap) => {
+        const data = snap.val() || {};
+        this.items = data.items || {};
+        this.stats = data.stats || {};
+        this.saveLocal();
+        this.renderList();
+        this.renderWeekSelector();
+        this.renderStats();
+        this.checkSmartSuggestions();
+      });
+    },
+
+    loadLocal() {
+      try {
+        const d = JSON.parse(localStorage.getItem('hasal_data') || '{}');
+        this.items = d.items || {};
+        this.stats = d.stats || {};
+      } catch(e) {}
+      this.renderList();
+      this.renderStats();
+      this.checkSmartSuggestions();
+    },
+
+    saveLocal() {
+      localStorage.setItem('hasal_data', JSON.stringify({ items: this.items, stats: this.stats }));
+    },
+
+    async saveData() {
+      if (this.db) {
+        await set(ref(this.db, '/'), { items: this.items, stats: this.stats });
+      } else {
+        this.saveLocal();
+        this.renderList();
+        this.renderStats();
+        this.checkSmartSuggestions();
+      }
+    },
+
+    async addItem(name, imageData = null, qty = 1, weekKey = null) {
+      if (!name.trim()) return;
+      const wk = weekKey || this.currentWeek;
+      if (!this.items[wk]) this.items[wk] = {};
+      const id = 'item_' + Date.now() + '_' + Math.random().toString(36).slice(2,6);
+      this.items[wk][id] = {
+        id, name: name.trim(), qty: qty || 1,
+        done: false, price: null,
+        image: imageData || null,
+        addedAt: Date.now(),
+        sortOrder: Date.now(),
+        autoAdded: false
+      };
+
+      // stats
+      const key = name.trim().toLowerCase();
+      if (!this.stats[key]) this.stats[key] = { count: 0, weeks: [], lastAdded: null };
+      if (!this.stats[key].weeks.includes(wk)) this.stats[key].weeks.push(wk);
+      this.stats[key].count++;
+      this.stats[key].lastAdded = Date.now();
+
+      await this.saveData();
+      document.getElementById('item-input').value = '';
+      document.getElementById('qty-input').value = '';
+      document.getElementById('image-preview').style.display = 'none';
+      window._pendingImage = null;
+    },
+
+    async toggleDone(weekKey, id) {
+      const item = this.items[weekKey]?.[id];
+      if (!item) return;
+      item.done = !item.done;
+      await this.saveData();
+    },
+
+    async setPrice(weekKey, id, price) {
+      if (this.items[weekKey]?.[id]) {
+        this.items[weekKey][id].price = parseFloat(price) || null;
+        await this.saveData();
+      }
+    },
+
+    async moveToNextWeek(weekKey, id) {
+      const item = this.items[weekKey]?.[id];
+      if (!item) return;
+      const d = new Date();
+      const next = getWeekKey(new Date(d.setDate(d.getDate() + 7)));
+      if (!this.items[next]) this.items[next] = {};
+      const newId = 'item_' + Date.now();
+      this.items[next][newId] = { ...item, id: newId, done: false, price: null, addedAt: Date.now() };
+      delete this.items[weekKey][id];
+      await this.saveData();
+      this.showToast('📅 הועבר לשבוע הבא!');
+    },
+
+    async deleteItem(weekKey, id) {
+      if (this.items[weekKey]?.[id]) {
+        delete this.items[weekKey][id];
+        await this.saveData();
+      }
+    },
+
+    renderList() {
+      const wk = this.currentWeek;
+      const items = this.items[wk] || {};
+      document.getElementById('week-label').textContent = getWeekLabel(wk);
+
+      const arr = Object.values(items).sort((a,b) => (a.sortOrder||a.addedAt) - (b.sortOrder||b.addedAt));
+      const pending = arr.filter(i => !i.done);
+      const done = arr.filter(i => i.done);
+
+      const totalPrice = done.reduce((s,i) => s + (i.price || 0), 0);
+      document.getElementById('total-price').textContent = totalPrice > 0 ? `סה״כ: ₪${totalPrice.toFixed(2)}` : '';
+      document.getElementById('item-count').textContent = `${pending.length} פריטים`;
+
+      const list = document.getElementById('items-list');
+      list.innerHTML = '';
+
+      if (arr.length === 0) {
+        list.innerHTML = `<div class="empty-state"><div class="empty-icon">🛒</div><p>הרשימה ריקה — הוסף מוצרים!</p></div>`;
+        return;
+      }
+
+      pending.forEach(item => list.appendChild(this.createItemEl(wk, item)));
+      if (done.length > 0) {
+        const div = document.createElement('div');
+        div.className = 'divider-label';
+        div.textContent = `✓ נלקח (${done.length})`;
+        list.appendChild(div);
+        done.forEach(item => list.appendChild(this.createItemEl(wk, item)));
+      }
+    },
+
+    createItemEl(weekKey, item) {
+      const el = document.createElement('div');
+      el.className = `item-wrap`;
+      el.dataset.id = item.id;
+
+      const qtyBadge = item.qty > 1 ? `<span class="qty-badge">×${item.qty}</span>` : '';
+      const imgHtml = item.image ? `<img src="${item.image}" class="item-thumb" onclick="event.stopPropagation();APP.showImage('${item.image}')">` : '';
+      const autoBadge = item.autoAdded ? `<span class="auto-badge">🤖 הסל הזכור</span>` : '';
+
+      el.innerHTML = `
+        <div class="swipe-hint-left">📅 שבוע הבא</div>
+        <div class="swipe-hint-right">🗑 מחיקה</div>
+        <div class="item-card ${item.done ? 'done' : ''}">
+          <div class="drag-handle" data-drag="true">⠿</div>
+          ${imgHtml}
+          <div class="item-content" onclick="APP.toggleDone('${weekKey}','${item.id}')">
+            <div class="item-top-row">
+              <span class="item-name">${item.name}</span>
+              ${qtyBadge}
+              ${autoBadge}
+            </div>
+            ${item.done ? '<span class="done-check">✓</span>' : ''}
+          </div>
+          <div class="price-inline">
+            <span class="price-currency">₪</span>
+            <input type="number" class="price-inline-input" placeholder="מחיר"
+              value="${item.price || ''}"
+              onclick="event.stopPropagation()"
+              onchange="APP.setPrice('${weekKey}','${item.id}',this.value)"
+              step="0.1" min="0">
+          </div>
+        </div>
+      `;
+
+      // Swipe logic
+      const card = el.querySelector('.item-card');
+      let startX = 0, currentX = 0, swiping = false;
+      const THRESHOLD = 80;
+
+      const onStart = (x) => { startX = x; swiping = true; card.style.transition = 'none'; };
+      const onMove = (x) => {
+        if (!swiping) return;
+        currentX = x - startX;
+        card.style.transform = `translateX(${currentX}px)`;
+        const hintL = el.querySelector('.swipe-hint-left');
+        const hintR = el.querySelector('.swipe-hint-right');
+        hintL.style.opacity = currentX < -20 ? Math.min(1, Math.abs(currentX)/THRESHOLD) : 0;
+        hintR.style.opacity = currentX > 20 ? Math.min(1, currentX/THRESHOLD) : 0;
+      };
+      const onEnd = () => {
+        if (!swiping) return;
+        swiping = false;
+        card.style.transition = 'transform 0.3s ease';
+        if (currentX < -THRESHOLD) {
+          card.style.transform = 'translateX(-120%)';
+          setTimeout(() => APP.moveToNextWeek(weekKey, item.id), 250);
+        } else if (currentX > THRESHOLD) {
+          card.style.transform = 'translateX(120%)';
+          setTimeout(() => APP.deleteItem(weekKey, item.id), 250);
+        } else {
+          card.style.transform = 'translateX(0)';
+          el.querySelector('.swipe-hint-left').style.opacity = 0;
+          el.querySelector('.swipe-hint-right').style.opacity = 0;
+        }
+        currentX = 0;
+      };
+
+      // Swipe events — only when NOT starting from drag handle
+      const isDragHandle = e => e.target.closest('[data-drag]');
+      card.addEventListener('touchstart', e => { if(!isDragHandle(e)) onStart(e.touches[0].clientX); }, { passive: true });
+      card.addEventListener('touchmove', e => onMove(e.touches[0].clientX), { passive: true });
+      card.addEventListener('touchend', onEnd);
+      card.addEventListener('mousedown', e => { if(!isDragHandle(e)) onStart(e.clientX); });
+      card.addEventListener('mousemove', e => { if (e.buttons === 1) onMove(e.clientX); });
+      card.addEventListener('mouseup', onEnd);
+      card.addEventListener('mouseleave', onEnd);
+
+      // Vertical drag-to-reorder on handle
+      const handle = el.querySelector('.drag-handle');
+      APP.attachDragSort(handle, el, weekKey);
+
+      return el;
+    },
+
+    attachDragSort(handle, el, weekKey) {
+      handle.addEventListener('touchstart', e => {
+        e.stopPropagation();
+        DRAG.start(el, e.touches[0].clientY);
+      }, { passive: true });
+      handle.addEventListener('mousedown', e => {
+        e.stopPropagation();
+        DRAG.start(el, e.clientY);
+      });
+    },
+
+    showImage(src) {
+      document.getElementById('img-modal-img').src = src;
+      document.getElementById('img-modal').classList.add('active');
+    },
+
+    renderWeekSelector() {
+      const weeks = Object.keys(this.items);
+      const now = getWeekKey();
+      const d2 = new Date(); d2.setDate(d2.getDate()+7);
+      const next = getWeekKey(d2);
+      const all = [...new Set([now, next, ...weeks])].sort().reverse();
+      const sel = document.getElementById('week-select');
+      const cur = sel.value || this.currentWeek;
+      sel.innerHTML = '';
+      all.forEach(wk => {
+        const opt = document.createElement('option');
+        opt.value = wk; opt.textContent = getWeekLabel(wk);
+        if (wk === cur) opt.selected = true;
+        sel.appendChild(opt);
+      });
+    },
+
+    switchWeek(wk) {
+      this.currentWeek = wk;
+      this.renderList();
+      this.checkSmartSuggestions();
+    },
+
+    // ── SMART STATS ──
+    checkSmartSuggestions() {
+      const wk = this.currentWeek;
+      const currentNames = Object.values(this.items[wk] || {}).map(i => i.name.toLowerCase());
+      const now = Date.now();
+      const suggestions = [];
+
+      Object.entries(this.stats).forEach(([name, stat]) => {
+        if (stat.count < 2) return;
+        if (currentNames.includes(name)) return;
+
+        const weeksArr = stat.weeks.sort();
+        const totalWeeksCovered = weeksArr.length;
+        // Avg interval between purchases in weeks
+        const avgIntervalWeeks = totalWeeksCovered > 1
+          ? (totalWeeksCovered - 1) / (stat.count - 1)
+          : 3;
+        const daysSinceLast = stat.lastAdded ? (now - stat.lastAdded) / 86400000 : 999;
+        const expectedDays = avgIntervalWeeks * 7;
+
+        if (daysSinceLast >= expectedDays * 0.8) {
+          suggestions.push({ name, expectedDays: Math.round(expectedDays), daysSinceLast: Math.round(daysSinceLast) });
+        }
+      });
+
+      const container = document.getElementById('suggestions');
+      if (!suggestions.length) { container.style.display = 'none'; return; }
+      container.style.display = 'block';
+      container.innerHTML = `<div class="suggestions-title">🤖 הסל הזכור — הגיע הזמן לקנות:</div>` +
+        suggestions.slice(0,6).map(s => `
+          <div class="suggestion-chip" onclick="APP.addItem('${s.name}');APP.showToast('✅ נוסף!')">
+            <span class="chip-name">${s.name}</span>
+            <span class="chip-meta">בד״כ כל ~${s.expectedDays} יום</span>
+            <span class="chip-add">+</span>
+          </div>
+        `).join('');
+
+      // Auto-add items that are way overdue (2x expected) and not yet in this week
+      suggestions.forEach(s => {
+        if (s.daysSinceLast >= s.expectedDays * 2) {
+          const alreadyAuto = Object.values(this.items[wk] || {}).some(i => i.name.toLowerCase() === s.name && i.autoAdded);
+          if (!alreadyAuto) {
+            this.addAutoItem(s.name, wk);
+          }
+        }
+      });
+    },
+
+    async addAutoItem(name, wk) {
+      if (!this.items[wk]) this.items[wk] = {};
+      const id = 'item_auto_' + Date.now() + '_' + Math.random().toString(36).slice(2,5);
+      this.items[wk][id] = {
+        id, name, qty: 1, done: false, price: null,
+        image: null, addedAt: Date.now(), autoAdded: true
+      };
+      await this.saveData();
+      this.showToast(`🤖 הסל הזכור הוסיף: ${name}`);
+    },
+
+    renderStats() {
+      const container = document.getElementById('stats-content');
+      const entries = Object.entries(this.stats)
+        .filter(([,s]) => s.count >= 1)
+        .map(([name, stat]) => {
+          const weeksArr = stat.weeks.sort();
+          const avgInterval = weeksArr.length > 1
+            ? Math.round((weeksArr.length - 1) / (stat.count - 1) * 7)
+            : '?';
+          return { name, count: stat.count, avgInterval, lastAdded: stat.lastAdded };
+        })
+        .sort((a,b) => b.count - a.count)
+        .slice(0, 20);
+
+      if (!entries.length) {
+        container.innerHTML = '<p class="stats-empty">עדיין אין נתונים — קנה ונצבור! 📊</p>';
+        return;
+      }
+
+      container.innerHTML = `
+        <div class="stats-header">
+          <span>מוצר</span><span>ממוצע קנייה</span><span>פעמים</span>
+        </div>
+        ${entries.map(e => `
+          <div class="stat-row">
+            <span class="stat-name">${e.name}</span>
+            <span class="stat-interval">${e.avgInterval === '?' ? '—' : `כל ~${e.avgInterval} ימים`}</span>
+            <span class="stat-count">${e.count}×</span>
+          </div>
+        `).join('')}
+      `;
+    },
+
+    comparePrice() {
+      const w1 = parseFloat(document.getElementById('p1-weight').value);
+      const pr1 = parseFloat(document.getElementById('p1-price').value);
+      const w2 = parseFloat(document.getElementById('p2-weight').value);
+      const pr2 = parseFloat(document.getElementById('p2-price').value);
+      if (!w1||!pr1||!w2||!pr2) { this.showToast('⚠️ מלא את כל השדות'); return; }
+      const u1 = pr1/w1, u2 = pr2/w2;
+      const res = document.getElementById('compare-result');
+      if (u1 < u2) {
+        const pct = (((u2-u1)/u2)*100).toFixed(1);
+        res.innerHTML = `<div class="compare-winner">🏆 מוצר א׳ זול ב-<strong>${pct}%</strong></div><div class="compare-detail">₪${u1.toFixed(3)} ליח׳ לעומת ₪${u2.toFixed(3)} ליח׳</div>`;
+      } else if (u2 < u1) {
+        const pct = (((u1-u2)/u1)*100).toFixed(1);
+        res.innerHTML = `<div class="compare-winner">🏆 מוצר ב׳ זול ב-<strong>${pct}%</strong></div><div class="compare-detail">₪${u2.toFixed(3)} ליח׳ לעומת ₪${u1.toFixed(3)} ליח׳</div>`;
+      } else {
+        res.innerHTML = `<div class="compare-winner">🤝 שניהם זהים!</div>`;
+      }
+    },
+
+    startVoice() {
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SR) { this.showToast('😢 הדפדפן לא תומך בקלט קולי'); return; }
+      const rec = new SR();
+      rec.lang = 'he-IL'; rec.interimResults = false;
+      const btn = document.getElementById('voice-btn');
+      btn.classList.add('recording'); btn.textContent = '🔴';
+      rec.start();
+      rec.onresult = e => {
+        let text = e.results[0][0].transcript
+          .replace(/תוסיפי|הוסיפי|הוסף|תוסיף/gi,'')
+          .replace(/לרשימה|לרשימת הקניות|לקניות/gi,'').trim();
+        document.getElementById('item-input').value = text;
+        this.showToast(`🎙️ שמעתי: ${text}`);
+        btn.classList.remove('recording'); btn.textContent = '🎙️';
+      };
+      rec.onerror = rec.onend = () => { btn.classList.remove('recording'); btn.textContent = '🎙️'; };
+    },
+
+    showToast(msg) {
+      const t = document.getElementById('toast');
+      t.textContent = msg; t.className = 'toast active';
+      setTimeout(() => t.className = 'toast', 2500);
+    }
+  };
+
+  window.addEventListener('DOMContentLoaded', () => window.APP.init());
+
+  // ── GLOBAL DRAG MANAGER (one set of listeners) ──
+  const DRAG = {
+    el: null, placeholder: null, startY: 0,
+
+    start(el, y) {
+      this.el = el;
+      this.startY = y;
+      const rect = el.getBoundingClientRect();
+      el.classList.add('dragging');
+      el.style.position = 'fixed';
+      el.style.top = rect.top + 'px';
+      el.style.left = rect.left + 'px';
+      el.style.width = rect.width + 'px';
+      el.style.zIndex = '500';
+      this.placeholder = document.createElement('div');
+      this.placeholder.className = 'drag-placeholder';
+      this.placeholder.style.height = rect.height + 'px';
+      el.after(this.placeholder);
+      document.body.style.overflow = 'hidden';
+    },
+
+    move(y) {
+      if (!this.el) return;
+      const dy = y - this.startY;
+      this.el.style.top = (parseFloat(this.el.style.top) + dy) + 'px';
+      this.startY = y;
+      const midY = parseFloat(this.el.style.top) + this.el.offsetHeight / 2;
+      const list = document.getElementById('items-list');
+      const siblings = [...list.querySelectorAll('.item-wrap')].filter(w => w !== this.el);
+      let inserted = false;
+      for (const sib of siblings) {
+        const r = sib.getBoundingClientRect();
+        if (midY < r.top + r.height / 2) {
+          list.insertBefore(this.placeholder, sib);
+          inserted = true; break;
+        }
+      }
+      if (!inserted) list.appendChild(this.placeholder);
+    },
+
+    async end() {
+      if (!this.el) return;
+      this.el.classList.remove('dragging');
+      this.el.style.cssText = '';
+      document.body.style.overflow = '';
+      this.placeholder.replaceWith(this.el);
+      const wk = APP.currentWeek;
+      const list = document.getElementById('items-list');
+      [...list.querySelectorAll('.item-wrap')].forEach((w, i) => {
+        const id = w.dataset.id;
+        if (APP.items[wk]?.[id]) APP.items[wk][id].sortOrder = i * 1000;
+      });
+      this.el = null;
+      this.placeholder = null;
+      await APP.saveData();
+    }
+  };
+
+  document.addEventListener('touchmove', e => {
+    if (DRAG.el) { e.preventDefault(); DRAG.move(e.touches[0].clientY); }
+  }, { passive: false });
+  document.addEventListener('touchend', () => { if (DRAG.el) DRAG.end(); });
+  document.addEventListener('mousemove', e => { if (DRAG.el) DRAG.move(e.clientY); });
+  document.addEventListener('mouseup', () => { if (DRAG.el) DRAG.end(); });
+</script>
+
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #22263a;
+    --accent: #4ade80;
+    --accent2: #38bdf8;
+    --warn: #fb923c;
+    --danger: #f87171;
+    --text: #f1f5f9;
+    --text2: #94a3b8;
+    --border: #2d3249;
+    --radius: 16px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  body { font-family: 'Rubik', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; direction: rtl; }
+
+  /* HEADER */
+  .header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 14px 16px 10px; position: sticky; top: 0; z-index: 100; }
+  .header-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .app-title { font-size: 1.4rem; font-weight: 900; }
+  .app-title span { color: var(--accent); }
+  .sync-badge { font-size: 0.7rem; padding: 3px 8px; border-radius: 20px; }
+  .sync-badge.online { background: rgba(74,222,128,0.15); color: var(--accent); }
+  .sync-badge.offline { background: rgba(148,163,184,0.15); color: var(--text2); }
+  .week-bar { display: flex; align-items: center; gap: 8px; }
+  #week-select { background: var(--surface2); color: var(--text); border: 1px solid var(--border); border-radius: 8px; padding: 6px 10px; font-family: inherit; font-size: 0.8rem; flex: 1; }
+  #week-label { font-size: 0.72rem; color: var(--text2); white-space: nowrap; }
+
+  /* TABS */
+  .tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--surface); }
+  .tab { flex: 1; padding: 11px; text-align: center; font-size: 0.78rem; cursor: pointer; border-bottom: 2px solid transparent; color: var(--text2); transition: all 0.2s; font-weight: 500; }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  /* PANELS */
+  .panel { display: none; padding: 14px; max-width: 600px; margin: 0 auto; }
+  .panel.active { display: block; }
+
+  /* ADD BAR */
+  .add-section { margin-bottom: 14px; }
+  .add-bar { display: flex; gap: 8px; background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px; align-items: center; margin-bottom: 8px; }
+  .add-bar input[type=text] { flex: 1; background: transparent; border: none; color: var(--text); font-family: inherit; font-size: 1rem; outline: none; }
+  .add-bar input::placeholder { color: var(--text2); }
+  .icon-btn { background: none; border: none; cursor: pointer; font-size: 1.2rem; padding: 4px 6px; border-radius: 8px; }
+  .add-main-btn { background: var(--accent); color: #000; border: none; cursor: pointer; border-radius: 10px; padding: 8px 14px; font-weight: 700; font-size: 0.9rem; font-family: inherit; white-space: nowrap; }
+
+  .qty-bar { display: flex; align-items: center; gap: 8px; }
+  .qty-bar label { font-size: 0.78rem; color: var(--text2); white-space: nowrap; margin: 0; }
+  .qty-bar input { background: var(--surface2); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 5px 10px; font-family: inherit; font-size: 0.9rem; width: 70px; text-align: center; }
+
+  /* IMAGE PREVIEW */
+  #image-preview { display: none; margin-bottom: 10px; }
+  #image-preview img { width: 70px; height: 70px; object-fit: cover; border-radius: 10px; border: 2px solid var(--accent); }
+
+  /* SUGGESTIONS */
+  #suggestions { display: none; margin-bottom: 12px; }
+  .suggestions-title { font-size: 0.75rem; color: var(--text2); margin-bottom: 8px; }
+  .suggestion-chip { display: inline-flex; align-items: center; gap: 6px; background: var(--surface2); border: 1px solid var(--border); border-radius: 20px; padding: 5px 10px; margin: 3px; cursor: pointer; font-size: 0.8rem; }
+  .suggestion-chip:active { border-color: var(--accent); }
+  .chip-name { font-weight: 500; }
+  .chip-meta { color: var(--text2); font-size: 0.65rem; }
+  .chip-add { background: var(--accent); color: #000; border: none; border-radius: 50%; width: 18px; height: 18px; cursor: pointer; font-weight: 700; font-size: 0.75rem; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+
+  /* LIST META */
+  .list-meta { display: flex; justify-content: space-between; margin-bottom: 10px; }
+  #item-count { font-size: 0.78rem; color: var(--text2); }
+  #total-price { font-size: 0.88rem; color: var(--accent); font-weight: 700; }
+
+  /* ITEM WRAP + SWIPE */
+  .item-wrap { position: relative; margin-bottom: 8px; overflow: hidden; border-radius: var(--radius); }
+  .swipe-hint-left, .swipe-hint-right {
+    position: absolute; top: 0; bottom: 0; display: flex; align-items: center;
+    padding: 0 20px; font-size: 0.8rem; font-weight: 700; opacity: 0;
+    transition: opacity 0.15s; pointer-events: none; z-index: 0; border-radius: var(--radius);
+  }
+  .swipe-hint-left { right: 0; background: linear-gradient(to left, rgba(56,189,248,0.3), transparent); color: var(--accent2); }
+  .swipe-hint-right { left: 0; background: linear-gradient(to right, rgba(248,113,113,0.3), transparent); color: var(--danger); }
+
+  .item-card {
+    position: relative; z-index: 1;
+    display: flex; align-items: center; gap: 10px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 11px 12px;
+    cursor: grab; user-select: none;
+    transition: transform 0.3s ease, opacity 0.3s;
+    animation: slideIn 0.2s ease;
+  }
+  @keyframes slideIn { from { opacity:0; transform: translateY(-6px); } to { opacity:1; transform: none; } }
+  .item-card.done { opacity: 0.5; }
+  .item-card:active { cursor: grabbing; }
+
+  .item-thumb { width: 40px; height: 40px; object-fit: cover; border-radius: 8px; flex-shrink: 0; cursor: pointer; }
+
+  .item-content { flex: 1; min-width: 0; }
+  .item-top-row { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .item-name { font-size: 0.95rem; font-weight: 500; }
+  .item-card.done .item-name { text-decoration: line-through; color: var(--text2); }
+  .done-check { font-size: 0.75rem; color: var(--accent); font-weight: 700; display: block; margin-top: 2px; }
+
+  .qty-badge { background: var(--accent2); color: #000; border-radius: 10px; padding: 1px 7px; font-size: 0.72rem; font-weight: 700; flex-shrink: 0; }
+  .auto-badge { background: rgba(74,222,128,0.15); color: var(--accent); border: 1px solid rgba(74,222,128,0.3); border-radius: 10px; padding: 1px 7px; font-size: 0.65rem; flex-shrink: 0; }
+
+  /* INLINE PRICE */
+  .price-inline { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+  .price-currency { font-size: 0.75rem; color: var(--text2); }
+  .price-inline-input {
+    width: 58px; background: var(--surface2); border: 1px solid var(--border);
+    color: var(--accent); border-radius: 8px; padding: 4px 6px;
+    font-family: inherit; font-size: 0.8rem; font-weight: 700;
+    text-align: center; outline: none;
+  }
+  .price-inline-input:focus { border-color: var(--accent); }
+  .price-inline-input::placeholder { color: var(--border); }
+
+  /* EMPTY */
+  .empty-state { text-align: center; padding: 40px 20px; color: var(--text2); }
+  .empty-icon { font-size: 3rem; margin-bottom: 10px; }
+  .divider-label { font-size: 0.75rem; color: var(--text2); padding: 8px 4px 4px; }
+  .drag-handle { font-size: 1.1rem; color: var(--text2); cursor: grab; padding: 0 6px; flex-shrink: 0; touch-action: none; line-height: 1; letter-spacing: -1px; user-select: none; }
+  .item-wrap.dragging { opacity: 0.85; box-shadow: 0 8px 32px rgba(0,0,0,0.5); border-radius: var(--radius); }
+  .drag-handle:active { cursor: grabbing; color: var(--text2); }
+  .drag-placeholder { background: rgba(74,222,128,0.08); border: 2px dashed var(--accent); border-radius: var(--radius); margin-bottom: 8px; }
+
+  /* STATS */
+  .stats-header { display: flex; gap: 8px; font-size: 0.7rem; color: var(--text2); font-weight: 700; padding-bottom: 6px; border-bottom: 1px solid var(--border); margin-bottom: 8px; }
+  .stats-header span:first-child { flex: 1; }
+  .stat-row { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid rgba(45,50,73,0.5); }
+  .stat-name { flex: 1; font-size: 0.85rem; }
+  .stat-interval { font-size: 0.75rem; color: var(--text2); min-width: 90px; }
+  .stat-count { font-size: 0.8rem; color: var(--accent); font-weight: 700; min-width: 30px; text-align: left; }
+  .stats-empty { color: var(--text2); font-size: 0.9rem; padding: 20px 0; }
+
+  /* COMPARE */
+  .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px; }
+  .compare-col { background: var(--surface2); border-radius: 12px; padding: 14px; }
+  .compare-col-title { font-size: 0.75rem; color: var(--text2); margin-bottom: 10px; font-weight: 700; }
+  .compare-col input { width: 100%; background: var(--surface); border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 8px 10px; font-family: inherit; font-size: 0.9rem; margin-bottom: 8px; direction: rtl; outline: none; }
+  .compare-col input:focus { border-color: var(--accent2); }
+  .compare-btn { width: 100%; background: var(--accent2); color: #000; border: none; border-radius: 10px; padding: 11px; font-weight: 700; font-size: 0.95rem; cursor: pointer; font-family: inherit; margin-bottom: 14px; }
+  .compare-winner { font-size: 1.1rem; font-weight: 700; text-align: center; margin-bottom: 6px; }
+  .compare-detail { font-size: 0.8rem; color: var(--text2); text-align: center; }
+
+  /* MODAL */
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.75); z-index: 1000; display: none; align-items: center; justify-content: center; backdrop-filter: blur(4px); padding: 20px; }
+  .modal-overlay.active { display: flex; }
+  .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 20px; padding: 22px; width: 100%; max-width: 340px; animation: popIn 0.2s ease; }
+  @keyframes popIn { from { transform: scale(0.9); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+  #img-modal-img { max-width: 100%; max-height: 70vh; object-fit: contain; border-radius: 12px; display: block; margin: 0 auto; }
+
+  /* VOICE */
+  #voice-btn.recording { animation: pulse 0.8s infinite; color: red; }
+  @keyframes pulse { 0%,100%{transform:scale(1)}50%{transform:scale(1.2)} }
+
+  /* TOAST */
+  .toast { position: fixed; bottom: 70px; left: 50%; transform: translateX(-50%) translateY(20px); background: var(--surface); border: 1px solid var(--border); padding: 10px 20px; border-radius: 20px; font-size: 0.88rem; opacity: 0; transition: all 0.3s; z-index: 2000; pointer-events: none; white-space: nowrap; }
+  .toast.active { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  label { font-size: 0.78rem; color: var(--text2); display: block; margin-bottom: 4px; }
+  @media (max-width: 400px) { .compare-grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-top">
+    <div class="app-title">🛒 הסל <span>שלנו</span></div>
+    <span id="sync-badge" class="sync-badge offline">טוען...</span>
+  </div>
+  <div class="week-bar">
+    <select id="week-select" onchange="APP.switchWeek(this.value)"></select>
+    <span id="week-label"></span>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('list',this)">🛒 רשימה</div>
+  <div class="tab" onclick="switchTab('stats',this)">📊 סטטיסטיקות</div>
+  <div class="tab" onclick="switchTab('compare',this)">⚖️ השוואה</div>
+</div>
+
+<!-- LIST -->
+<div id="list-panel" class="panel active">
+
+  <div id="image-preview">
+    <img id="preview-img" src="" alt="">
+    <button onclick="clearImage()" style="margin-top:4px;background:var(--danger);color:#fff;border:none;border-radius:6px;padding:2px 8px;cursor:pointer;font-size:0.72rem">הסר תמונה</button>
+  </div>
+
+  <div class="add-section">
+    <div class="add-bar">
+      <button class="icon-btn" id="voice-btn" onclick="APP.startVoice()">🎙️</button>
+      <input type="text" id="item-input" placeholder="מוצר חדש..."
+        onkeydown="if(event.key==='Enter') doAdd()">
+      <label class="icon-btn" style="cursor:pointer;margin:0">
+        📷<input type="file" accept="image/*" style="display:none" onchange="handleImage(event)">
+      </label>
+      <button class="add-main-btn" onclick="doAdd()">הוסף</button>
+    </div>
+    <div class="qty-bar">
+      <label style="margin:0">כמות:</label>
+      <input type="number" id="qty-input" placeholder="1" min="1" max="99" style="width:60px">
+    </div>
+  </div>
+
+  <div id="suggestions"></div>
+
+  <div class="list-meta">
+    <span id="item-count"></span>
+    <span id="total-price"></span>
+  </div>
+
+  <div id="items-list"></div>
+</div>
+
+<!-- STATS -->
+<div id="stats-panel" class="panel">
+  <p style="font-size:1rem;font-weight:700;margin-bottom:14px">📊 דפוסי הקנייה שלי</p>
+  <p style="font-size:0.78rem;color:var(--text2);margin-bottom:14px">הסל לומד מתי אתה קונה כל מוצר ומוסיף המלצות אוטומטיות</p>
+  <div id="stats-content"></div>
+</div>
+
+<!-- COMPARE -->
+<div id="compare-panel" class="panel">
+  <p style="font-size:1rem;font-weight:700;margin-bottom:14px">⚖️ מה יותר משתלם?</p>
+  <div class="compare-grid">
+    <div class="compare-col">
+      <div class="compare-col-title">מוצר א׳</div>
+      <label>משקל / נפח (גרם / מ״ל)</label>
+      <input type="number" id="p1-weight" placeholder="500">
+      <label>מחיר (₪)</label>
+      <input type="number" id="p1-price" placeholder="12.90">
+    </div>
+    <div class="compare-col">
+      <div class="compare-col-title">מוצר ב׳</div>
+      <label>משקל / נפח</label>
+      <input type="number" id="p2-weight" placeholder="1000">
+      <label>מחיר (₪)</label>
+      <input type="number" id="p2-price" placeholder="19.90">
+    </div>
+  </div>
+  <button class="compare-btn" onclick="APP.comparePrice()">השווה עכשיו 🔍</button>
+  <div id="compare-result"></div>
+</div>
+
+<!-- IMAGE MODAL -->
+<div class="modal-overlay" id="img-modal" onclick="this.classList.remove('active')">
+  <div class="modal" style="background:transparent;border:none;max-width:90vw">
+    <img id="img-modal-img" src="" alt="">
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+  function switchTab(name, el) {
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.getElementById(name+'-panel').classList.add('active');
+    el.classList.add('active');
+    if (name === 'stats') APP.renderStats();
+  }
+
+  function doAdd() {
+    const name = document.getElementById('item-input').value.trim();
+    const qty = parseInt(document.getElementById('qty-input').value) || 1;
+    if (name) APP.addItem(name, window._pendingImage, qty);
+  }
+
+  function handleImage(e) {
+    const file = e.target.files[0]; if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      window._pendingImage = ev.target.result;
+      document.getElementById('preview-img').src = ev.target.result;
+      document.getElementById('image-preview').style.display = 'block';
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function clearImage() {
+    window._pendingImage = null;
+    document.getElementById('image-preview').style.display = 'none';
+    document.getElementById('preview-img').src = '';
+  }
+</script>
+</body>
+</html>
