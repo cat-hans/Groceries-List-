@@ -1,0 +1,825 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<title>🛒 הסל שלנו</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Rubik:wght@300;400;500;700;900&family=Heebo:wght@300;400;700&display=swap" rel="stylesheet">
+
+<!-- Firebase SDK -->
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+  import { getDatabase, ref, set, onValue, push, remove, update } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js";
+
+  // ====================================================
+  // 🔧 הגדר כאן את פרטי ה-Firebase שלך
+  // ====================================================
+  const firebaseConfig = {
+    apiKey: "AIzaSyDug3fqhFWzZVE_tTw1ee1RFOdsARlRqNc",
+    authDomain: "grocery-list-dbbdd.firebaseapp.com",
+    databaseURL: "https://grocery-list-dbbdd-default-rtdb.firebaseio.com",
+    projectId: "grocery-list-dbbdd",
+    storageBucket: "grocery-list-dbbdd.firebasestorage.app",
+    messagingSenderId: "1079059037973",
+    appId: "1:1079059037973:web:0d281a9fcea0b227f6b31c"
+  };
+  // ====================================================
+
+  let db = null;
+  let currentWeekKey = null;
+
+  function getWeekKey(date = new Date()) {
+    const d = new Date(date);
+    d.setHours(0,0,0,0);
+    d.setDate(d.getDate() - d.getDay()); // Sunday
+    return `week_${d.getFullYear()}_${String(d.getMonth()+1).padStart(2,'0')}_${String(d.getDate()).padStart(2,'0')}`;
+  }
+
+  function getWeekLabel(key) {
+    const parts = key.replace('week_','').split('_');
+    const d = new Date(parseInt(parts[0]), parseInt(parts[1])-1, parseInt(parts[2]));
+    const end = new Date(d); end.setDate(d.getDate()+6);
+    const fmt = (dt) => `${dt.getDate()}/${dt.getMonth()+1}/${dt.getFullYear()}`;
+    return `${fmt(d)} – ${fmt(end)}`;
+  }
+
+  window.APP = {
+    db: null,
+    currentWeek: null,
+    items: {},
+    stats: {},
+    priceMode: false,
+
+    async init() {
+      currentWeekKey = getWeekKey();
+      this.currentWeek = currentWeekKey;
+
+      // Try Firebase
+      try {
+        if (firebaseConfig.apiKey !== "YOUR_API_KEY") {
+          const app = initializeApp(firebaseConfig);
+          db = getDatabase(app);
+          this.db = db;
+          this.listenToData();
+          document.getElementById('sync-badge').textContent = '☁️ מסונכרן';
+          document.getElementById('sync-badge').className = 'sync-badge online';
+        } else {
+          this.loadLocal();
+          document.getElementById('sync-badge').textContent = '💾 מקומי בלבד';
+          document.getElementById('sync-badge').className = 'sync-badge offline';
+        }
+      } catch(e) {
+        this.loadLocal();
+        document.getElementById('sync-badge').textContent = '💾 מקומי';
+        document.getElementById('sync-badge').className = 'sync-badge offline';
+      }
+
+      this.renderWeekSelector();
+      this.renderStats();
+      this.checkSmartSuggestions();
+    },
+
+    listenToData() {
+      const r = ref(db, '/');
+      onValue(r, (snap) => {
+        const data = snap.val() || {};
+        this.items = data.items || {};
+        this.stats = data.stats || {};
+        this.saveLocal();
+        this.renderList();
+        this.renderWeekSelector();
+        this.renderStats();
+        this.checkSmartSuggestions();
+      });
+    },
+
+    loadLocal() {
+      try {
+        const d = JSON.parse(localStorage.getItem('hasal_data') || '{}');
+        this.items = d.items || {};
+        this.stats = d.stats || {};
+      } catch(e) {}
+      this.renderList();
+    },
+
+    saveLocal() {
+      localStorage.setItem('hasal_data', JSON.stringify({ items: this.items, stats: this.stats }));
+    },
+
+    async saveData(path, value) {
+      if (this.db) {
+        await set(ref(this.db, path), value);
+      } else {
+        this.saveLocal();
+        this.renderList();
+        this.renderWeekSelector();
+        this.renderStats();
+      }
+    },
+
+    async addItem(name, imageData = null, weekKey = null) {
+      if (!name.trim()) return;
+      const wk = weekKey || this.currentWeek;
+      if (!this.items[wk]) this.items[wk] = {};
+      const id = 'item_' + Date.now() + '_' + Math.random().toString(36).slice(2,6);
+      const item = {
+        id, name: name.trim(),
+        done: false, price: null,
+        image: imageData || null,
+        addedAt: Date.now()
+      };
+      this.items[wk][id] = item;
+
+      // Update stats
+      const key = name.trim().toLowerCase();
+      if (!this.stats[key]) this.stats[key] = { count: 0, weeks: [], lastAdded: null };
+      if (!this.stats[key].weeks.includes(wk)) this.stats[key].weeks.push(wk);
+      this.stats[key].count++;
+      this.stats[key].lastAdded = Date.now();
+
+      await this.saveData('/', { items: this.items, stats: this.stats });
+      document.getElementById('item-input').value = '';
+      document.getElementById('image-preview').style.display = 'none';
+      window._pendingImage = null;
+    },
+
+    async toggleDone(weekKey, id) {
+      const item = this.items[weekKey]?.[id];
+      if (!item) return;
+      item.done = !item.done;
+      await this.saveData('/', { items: this.items, stats: this.stats });
+
+      if (item.done) {
+        setTimeout(() => this.showPricePrompt(weekKey, id), 300);
+      }
+    },
+
+    async setPrice(weekKey, id, price) {
+      if (this.items[weekKey]?.[id]) {
+        this.items[weekKey][id].price = parseFloat(price) || null;
+        await this.saveData('/', { items: this.items, stats: this.stats });
+      }
+    },
+
+    async moveToNextWeek(weekKey, id) {
+      const item = this.items[weekKey]?.[id];
+      if (!item) return;
+      const d = new Date();
+      const next = getWeekKey(new Date(d.setDate(d.getDate() + 7)));
+      if (!this.items[next]) this.items[next] = {};
+      const newId = 'item_' + Date.now();
+      this.items[next][newId] = { ...item, id: newId, done: false, price: null, addedAt: Date.now() };
+      delete this.items[weekKey][id];
+      await this.saveData('/', { items: this.items, stats: this.stats });
+      this.showToast('📅 הועבר לשבוע הבא!');
+    },
+
+    async deleteItem(weekKey, id) {
+      if (this.items[weekKey]?.[id]) {
+        delete this.items[weekKey][id];
+        await this.saveData('/', { items: this.items, stats: this.stats });
+      }
+    },
+
+    showPricePrompt(weekKey, id) {
+      const item = this.items[weekKey]?.[id];
+      if (!item) return;
+      const modal = document.getElementById('price-modal');
+      document.getElementById('price-item-name').textContent = item.name;
+      document.getElementById('price-input-field').value = item.price || '';
+      modal.dataset.week = weekKey;
+      modal.dataset.id = id;
+      modal.classList.add('active');
+      document.getElementById('price-input-field').focus();
+    },
+
+    renderList() {
+      const wk = this.currentWeek;
+      const items = this.items[wk] || {};
+      const label = getWeekLabel(wk);
+      document.getElementById('week-label').textContent = label;
+
+      const list = document.getElementById('items-list');
+      const arr = Object.values(items).sort((a,b) => a.addedAt - b.addedAt);
+      const pending = arr.filter(i => !i.done);
+      const done = arr.filter(i => i.done);
+
+      const totalPrice = done.reduce((s, i) => s + (i.price || 0), 0);
+      document.getElementById('total-price').textContent = totalPrice > 0 ? `סה״כ: ₪${totalPrice.toFixed(2)}` : '';
+
+      const countEl = document.getElementById('item-count');
+      countEl.textContent = `${pending.length} פריטים נותרו`;
+
+      list.innerHTML = '';
+
+      if (pending.length === 0 && done.length === 0) {
+        list.innerHTML = `<div class="empty-state">
+          <div class="empty-icon">🛒</div>
+          <p>הרשימה ריקה — הוסף מוצרים!</p>
+        </div>`;
+        return;
+      }
+
+      pending.forEach(item => list.appendChild(this.createItemEl(wk, item, false)));
+      if (done.length > 0) {
+        const divider = document.createElement('div');
+        divider.className = 'divider-label';
+        divider.textContent = `✓ נלקח (${done.length})`;
+        list.appendChild(divider);
+        done.forEach(item => list.appendChild(this.createItemEl(wk, item, true)));
+      }
+    },
+
+    createItemEl(weekKey, item, isDone) {
+      const el = document.createElement('div');
+      el.className = `item-card ${isDone ? 'done' : ''}`;
+      el.dataset.id = item.id;
+
+      let imgHtml = item.image ? `<img src="${item.image}" class="item-thumb" onclick="event.stopPropagation();APP.showImage('${item.image}')">` : '';
+      let priceHtml = item.price ? `<span class="item-price">₪${parseFloat(item.price).toFixed(2)}</span>` : '';
+
+      el.innerHTML = `
+        <div class="item-check ${isDone ? 'checked' : ''}" onclick="APP.toggleDone('${weekKey}','${item.id}')">
+          ${isDone ? '✓' : ''}
+        </div>
+        ${imgHtml}
+        <div class="item-content">
+          <span class="item-name">${item.name}</span>
+          ${priceHtml}
+        </div>
+        <div class="item-actions">
+          <button class="action-btn next-btn" onclick="event.stopPropagation();APP.moveToNextWeek('${weekKey}','${item.id}')" title="העבר לשבוע הבא">📅</button>
+          <button class="action-btn del-btn" onclick="event.stopPropagation();APP.deleteItem('${weekKey}','${item.id}')" title="מחק">🗑</button>
+        </div>
+      `;
+
+      // Long press for next week
+      let pressTimer;
+      el.addEventListener('touchstart', () => {
+        pressTimer = setTimeout(() => {
+          if (!isDone) this.showContextMenu(weekKey, item.id);
+        }, 700);
+      });
+      el.addEventListener('touchend', () => clearTimeout(pressTimer));
+      el.addEventListener('touchmove', () => clearTimeout(pressTimer));
+
+      return el;
+    },
+
+    showContextMenu(weekKey, id) {
+      const item = this.items[weekKey]?.[id];
+      if (!item) return;
+      const modal = document.getElementById('context-modal');
+      document.getElementById('ctx-item-name').textContent = item.name;
+      modal.dataset.week = weekKey;
+      modal.dataset.id = id;
+      modal.classList.add('active');
+    },
+
+    showImage(src) {
+      const m = document.getElementById('img-modal');
+      document.getElementById('img-modal-img').src = src;
+      m.classList.add('active');
+    },
+
+    renderWeekSelector() {
+      const weeks = Object.keys(this.items).sort().reverse();
+      const sel = document.getElementById('week-select');
+      sel.innerHTML = '';
+      const allWeeks = [getWeekKey()];
+      const nextD = new Date(); nextD.setDate(nextD.getDate()+7);
+      allWeeks.push(getWeekKey(nextD));
+      weeks.forEach(w => { if (!allWeeks.includes(w)) allWeeks.push(w); });
+      allWeeks.sort().reverse();
+
+      allWeeks.forEach(wk => {
+        const opt = document.createElement('option');
+        opt.value = wk;
+        opt.textContent = getWeekLabel(wk);
+        if (wk === this.currentWeek) opt.selected = true;
+        sel.appendChild(opt);
+      });
+    },
+
+    switchWeek(wk) {
+      this.currentWeek = wk;
+      this.renderList();
+    },
+
+    checkSmartSuggestions() {
+      const currentItems = Object.values(this.items[this.currentWeek] || {}).map(i => i.name.toLowerCase());
+      const suggestions = [];
+      const now = Date.now();
+      const weekMs = 7*24*60*60*1000;
+
+      Object.entries(this.stats).forEach(([name, stat]) => {
+        if (stat.count < 2) return;
+        if (currentItems.includes(name)) return;
+
+        const weeksCount = stat.weeks.length;
+        const firstDate = parseInt(stat.weeks[0].split('_').slice(1).join('-').replace(/_/g,'-'));
+        const daysSince = stat.lastAdded ? (now - stat.lastAdded) / (1000*60*60*24) : 999;
+
+        // Estimate frequency
+        if (weeksCount >= 2) {
+          const avgWeeksBetween = weeksCount > 0 ? (weeksCount / stat.count) : 4;
+          const expectedDays = avgWeeksBetween * 7;
+          if (daysSince >= expectedDays * 0.85) {
+            suggestions.push({ name, daysSince: Math.round(daysSince), expected: Math.round(expectedDays) });
+          }
+        }
+      });
+
+      const container = document.getElementById('suggestions');
+      if (suggestions.length === 0) { container.style.display='none'; return; }
+      container.style.display = 'block';
+      container.innerHTML = `<div class="suggestions-title">🧠 הסל הזכור</div>` +
+        suggestions.slice(0,5).map(s => `
+          <div class="suggestion-chip" onclick="APP.addItem('${s.name}');APP.showToast('✅ נוסף!')">
+            <span>${s.name}</span>
+            <small>~כל ${s.expected} יום</small>
+            <button class="chip-add">+</button>
+          </div>
+        `).join('');
+    },
+
+    renderStats() {
+      const container = document.getElementById('stats-content');
+      const entries = Object.entries(this.stats)
+        .filter(([,s]) => s.count >= 1)
+        .sort((a,b) => b[1].count - a[1].count)
+        .slice(0, 20);
+
+      if (entries.length === 0) {
+        container.innerHTML = '<p class="stats-empty">עדיין אין נתונים — קנה ונצבור! 📊</p>';
+        return;
+      }
+
+      container.innerHTML = entries.map(([name, stat]) => {
+        const pct = Math.min(100, (stat.count / (entries[0][1].count)) * 100);
+        return `<div class="stat-row">
+          <span class="stat-name">${name}</span>
+          <div class="stat-bar-wrap"><div class="stat-bar" style="width:${pct}%"></div></div>
+          <span class="stat-count">${stat.count}×</span>
+        </div>`;
+      }).join('');
+    },
+
+    showToast(msg) {
+      const t = document.getElementById('toast');
+      t.textContent = msg;
+      t.className = 'toast active';
+      setTimeout(() => t.className = 'toast', 2500);
+    },
+
+    // Price comparison
+    comparePrice() {
+      const w1 = parseFloat(document.getElementById('p1-weight').value);
+      const pr1 = parseFloat(document.getElementById('p1-price').value);
+      const w2 = parseFloat(document.getElementById('p2-weight').value);
+      const pr2 = parseFloat(document.getElementById('p2-price').value);
+
+      if (!w1 || !pr1 || !w2 || !pr2) { this.showToast('⚠️ מלא את כל השדות'); return; }
+
+      const unit1 = pr1 / w1;
+      const unit2 = pr2 / w2;
+      const res = document.getElementById('compare-result');
+
+      if (unit1 < unit2) {
+        const pct = (((unit2 - unit1) / unit2) * 100).toFixed(1);
+        res.innerHTML = `<div class="compare-winner">🏆 מוצר א׳ משתלם יותר ב-<strong>${pct}%</strong></div>
+          <div class="compare-detail">₪${unit1.toFixed(3)} ליח׳ vs ₪${unit2.toFixed(3)} ליח׳</div>`;
+      } else if (unit2 < unit1) {
+        const pct = (((unit1 - unit2) / unit1) * 100).toFixed(1);
+        res.innerHTML = `<div class="compare-winner">🏆 מוצר ב׳ משתלם יותר ב-<strong>${pct}%</strong></div>
+          <div class="compare-detail">₪${unit2.toFixed(3)} ליח׳ vs ₪${unit1.toFixed(3)} ליח׳</div>`;
+      } else {
+        res.innerHTML = `<div class="compare-winner">🤝 שניהם שווים בדיוק!</div>`;
+      }
+    },
+
+    // Voice input
+    startVoice() {
+      if (!('webkitSpeechRecognition' in window) && !('SpeechRecognition' in window)) {
+        this.showToast('😢 הדפדפן לא תומך בקלט קולי');
+        return;
+      }
+      const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+      const rec = new SR();
+      rec.lang = 'he-IL';
+      rec.interimResults = false;
+      const btn = document.getElementById('voice-btn');
+      btn.classList.add('recording');
+      btn.textContent = '🔴';
+      rec.start();
+      rec.onresult = (e) => {
+        let text = e.results[0][0].transcript;
+        // Parse "תוסיפי X לרשימה" or "הוסף X"
+        text = text.replace(/תוסיפי|הוסיפי|הוסף|תוסיף/gi,'').replace(/לרשימה|לרשימת הקניות|לקניות/gi,'').trim();
+        document.getElementById('item-input').value = text;
+        this.showToast(`🎙️ שמעתי: ${text}`);
+        btn.classList.remove('recording');
+        btn.textContent = '🎙️';
+      };
+      rec.onerror = () => { btn.classList.remove('recording'); btn.textContent = '🎙️'; };
+      rec.onend = () => { btn.classList.remove('recording'); btn.textContent = '🎙️'; };
+    }
+  };
+
+  window.addEventListener('DOMContentLoaded', () => window.APP.init());
+</script>
+
+<style>
+  :root {
+    --bg: #0f1117;
+    --surface: #1a1d27;
+    --surface2: #22263a;
+    --accent: #4ade80;
+    --accent2: #38bdf8;
+    --warn: #fb923c;
+    --danger: #f87171;
+    --text: #f1f5f9;
+    --text2: #94a3b8;
+    --border: #2d3249;
+    --radius: 16px;
+    --shadow: 0 4px 24px rgba(0,0,0,0.4);
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+
+  body {
+    font-family: 'Rubik', 'Heebo', sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    min-height: 100vh;
+    direction: rtl;
+  }
+
+  /* ── HEADER ── */
+  .header {
+    background: linear-gradient(135deg, #1a1d27 0%, #0f1117 100%);
+    border-bottom: 1px solid var(--border);
+    padding: 16px 20px 12px;
+    position: sticky; top: 0; z-index: 100;
+  }
+  .header-top { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+  .app-title { font-size: 1.5rem; font-weight: 900; letter-spacing: -0.5px; }
+  .app-title span { color: var(--accent); }
+  .sync-badge { font-size: 0.7rem; padding: 3px 8px; border-radius: 20px; }
+  .sync-badge.online { background: rgba(74,222,128,0.15); color: var(--accent); }
+  .sync-badge.offline { background: rgba(148,163,184,0.15); color: var(--text2); }
+
+  .week-bar { display: flex; align-items: center; gap: 8px; }
+  #week-select {
+    background: var(--surface2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 10px; font-family: inherit; font-size: 0.8rem;
+    flex: 1; direction: rtl;
+  }
+  #week-label { font-size: 0.75rem; color: var(--text2); white-space: nowrap; }
+
+  /* ── TABS ── */
+  .tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--surface); }
+  .tab {
+    flex: 1; padding: 12px; text-align: center; font-size: 0.8rem; cursor: pointer;
+    border-bottom: 2px solid transparent; color: var(--text2); transition: all 0.2s;
+    font-weight: 500;
+  }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+  /* ── PANELS ── */
+  .panel { display: none; padding: 16px; max-width: 600px; margin: 0 auto; }
+  .panel.active { display: block; }
+
+  /* ── ADD ITEM ── */
+  .add-bar {
+    display: flex; gap: 8px; margin-bottom: 16px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 8px; align-items: center;
+  }
+  .add-bar input {
+    flex: 1; background: transparent; border: none; color: var(--text);
+    font-family: inherit; font-size: 1rem; outline: none;
+  }
+  .add-bar input::placeholder { color: var(--text2); }
+  .icon-btn {
+    background: none; border: none; cursor: pointer; font-size: 1.3rem;
+    padding: 4px 6px; border-radius: 8px; transition: background 0.15s;
+  }
+  .icon-btn:hover { background: var(--surface2); }
+  .add-main-btn {
+    background: var(--accent); color: #000; border: none; cursor: pointer;
+    border-radius: 10px; padding: 8px 16px; font-weight: 700; font-size: 0.95rem;
+    font-family: inherit; transition: transform 0.1s, opacity 0.1s;
+  }
+  .add-main-btn:active { transform: scale(0.95); }
+
+  #image-preview { display: none; margin-bottom: 12px; }
+  #image-preview img { width: 80px; height: 80px; object-fit: cover; border-radius: 10px; border: 2px solid var(--accent); }
+
+  /* ── SUGGESTIONS ── */
+  #suggestions { display: none; margin-bottom: 14px; }
+  .suggestions-title { font-size: 0.75rem; color: var(--text2); margin-bottom: 8px; font-weight: 500; }
+  .suggestion-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 20px; padding: 6px 12px; margin: 4px; cursor: pointer;
+    font-size: 0.8rem; transition: border-color 0.2s;
+  }
+  .suggestion-chip:hover { border-color: var(--accent); }
+  .suggestion-chip small { color: var(--text2); font-size: 0.65rem; }
+  .chip-add { background: var(--accent); color: #000; border: none; border-radius: 50%; width: 18px; height: 18px; cursor: pointer; font-weight: 700; font-size: 0.75rem; line-height: 1; }
+
+  /* ── META ── */
+  .list-meta { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  #item-count { font-size: 0.8rem; color: var(--text2); }
+  #total-price { font-size: 0.9rem; color: var(--accent); font-weight: 700; }
+
+  /* ── ITEMS ── */
+  .empty-state { text-align: center; padding: 40px 20px; color: var(--text2); }
+  .empty-icon { font-size: 3rem; margin-bottom: 12px; }
+
+  .item-card {
+    display: flex; align-items: center; gap: 10px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 12px 14px; margin-bottom: 8px;
+    transition: all 0.25s; position: relative; user-select: none;
+    animation: slideIn 0.2s ease;
+  }
+  @keyframes slideIn { from { opacity:0; transform: translateY(-8px); } to { opacity:1; transform: translateY(0); } }
+
+  .item-card.done { opacity: 0.55; background: var(--surface2); }
+  .item-card:hover { border-color: var(--accent2); }
+
+  .item-check {
+    width: 28px; height: 28px; border-radius: 50%;
+    border: 2px solid var(--border); display: flex; align-items: center; justify-content: center;
+    cursor: pointer; flex-shrink: 0; font-size: 0.85rem; font-weight: 700;
+    transition: all 0.2s;
+  }
+  .item-check.checked { background: var(--accent); border-color: var(--accent); color: #000; }
+  .item-check:hover { border-color: var(--accent); }
+
+  .item-thumb { width: 42px; height: 42px; object-fit: cover; border-radius: 8px; flex-shrink: 0; cursor: pointer; }
+
+  .item-content { flex: 1; min-width: 0; }
+  .item-name { display: block; font-size: 0.95rem; font-weight: 500; }
+  .item-card.done .item-name { text-decoration: line-through; }
+  .item-price { display: inline-block; font-size: 0.75rem; color: var(--accent); margin-top: 2px; font-weight: 700; }
+
+  .item-actions { display: flex; gap: 4px; }
+  .action-btn { background: none; border: none; cursor: pointer; font-size: 1rem; padding: 4px; border-radius: 6px; opacity: 0; transition: opacity 0.2s; }
+  .item-card:hover .action-btn { opacity: 1; }
+  .action-btn:hover { background: var(--surface2); }
+
+  .divider-label { font-size: 0.75rem; color: var(--text2); padding: 8px 4px 4px; font-weight: 500; }
+
+  /* ── STATS ── */
+  .section-title { font-size: 1rem; font-weight: 700; margin-bottom: 14px; }
+  .stat-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; }
+  .stat-name { width: 120px; font-size: 0.82rem; flex-shrink: 0; }
+  .stat-bar-wrap { flex: 1; height: 6px; background: var(--surface2); border-radius: 3px; overflow: hidden; }
+  .stat-bar { height: 100%; background: linear-gradient(90deg, var(--accent2), var(--accent)); border-radius: 3px; transition: width 0.5s; }
+  .stat-count { font-size: 0.75rem; color: var(--text2); width: 30px; text-align: left; }
+  .stats-empty { color: var(--text2); font-size: 0.9rem; padding: 20px 0; }
+
+  /* ── PRICE COMPARE ── */
+  .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 14px; }
+  .compare-col { background: var(--surface2); border-radius: 12px; padding: 14px; }
+  .compare-col-title { font-size: 0.75rem; color: var(--text2); margin-bottom: 10px; font-weight: 700; }
+  .compare-col input {
+    width: 100%; background: var(--surface); border: 1px solid var(--border);
+    color: var(--text); border-radius: 8px; padding: 8px 10px;
+    font-family: inherit; font-size: 0.9rem; margin-bottom: 8px; direction: rtl;
+  }
+  .compare-col input:focus { outline: none; border-color: var(--accent2); }
+  .compare-btn {
+    width: 100%; background: var(--accent2); color: #000; border: none;
+    border-radius: 10px; padding: 11px; font-weight: 700; font-size: 0.95rem;
+    cursor: pointer; font-family: inherit; margin-bottom: 14px;
+  }
+  #compare-result { text-align: center; }
+  .compare-winner { font-size: 1.1rem; font-weight: 700; margin-bottom: 6px; }
+  .compare-detail { font-size: 0.8rem; color: var(--text2); }
+
+  /* ── MODALS ── */
+  .modal-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 1000;
+    display: none; align-items: center; justify-content: center;
+    backdrop-filter: blur(4px); padding: 20px;
+  }
+  .modal-overlay.active { display: flex; }
+  .modal {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 20px; padding: 24px; width: 100%; max-width: 340px;
+    animation: popIn 0.2s ease;
+  }
+  @keyframes popIn { from { transform: scale(0.9); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
+  .modal h3 { font-size: 1rem; margin-bottom: 16px; }
+  .modal input {
+    width: 100%; background: var(--surface2); border: 1px solid var(--border);
+    color: var(--text); border-radius: 10px; padding: 11px 14px;
+    font-family: inherit; font-size: 1rem; margin-bottom: 12px; direction: rtl;
+  }
+  .modal input:focus { outline: none; border-color: var(--accent); }
+  .modal-btns { display: flex; gap: 8px; }
+  .btn-primary { flex: 1; background: var(--accent); color: #000; border: none; border-radius: 10px; padding: 11px; font-weight: 700; cursor: pointer; font-family: inherit; font-size: 0.95rem; }
+  .btn-secondary { flex: 1; background: var(--surface2); color: var(--text); border: 1px solid var(--border); border-radius: 10px; padding: 11px; cursor: pointer; font-family: inherit; font-size: 0.95rem; }
+
+  .ctx-btn {
+    display: block; width: 100%; text-align: right; background: var(--surface2);
+    border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px;
+    color: var(--text); font-family: inherit; font-size: 0.95rem;
+    cursor: pointer; margin-bottom: 8px; transition: border-color 0.15s;
+  }
+  .ctx-btn:hover { border-color: var(--accent); }
+  .ctx-btn.danger { color: var(--danger); }
+
+  #img-modal-img { max-width: 100%; max-height: 70vh; object-fit: contain; border-radius: 12px; display: block; margin: 0 auto; }
+
+  /* ── VOICE BTN ── */
+  #voice-btn { position: relative; }
+  #voice-btn.recording { animation: pulse 0.8s infinite; color: red; }
+  @keyframes pulse { 0%,100% { transform: scale(1); } 50% { transform: scale(1.2); } }
+
+  /* ── TOAST ── */
+  .toast {
+    position: fixed; bottom: 80px; left: 50%; transform: translateX(-50%) translateY(20px);
+    background: var(--surface); border: 1px solid var(--border);
+    padding: 10px 20px; border-radius: 20px; font-size: 0.9rem;
+    opacity: 0; transition: all 0.3s; z-index: 2000; pointer-events: none; white-space: nowrap;
+  }
+  .toast.active { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  /* ── CONFIG NOTE ── */
+  .config-note {
+    background: rgba(251,146,60,0.1); border: 1px solid var(--warn);
+    border-radius: 12px; padding: 12px 14px; margin-bottom: 16px; font-size: 0.8rem;
+    color: var(--warn); line-height: 1.5;
+  }
+
+  label { font-size: 0.8rem; color: var(--text2); display: block; margin-bottom: 4px; }
+
+  @media (max-width: 400px) {
+    .compare-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-top">
+    <div class="app-title">🛒 הסל <span>שלנו</span></div>
+    <span id="sync-badge" class="sync-badge offline">טוען...</span>
+  </div>
+  <div class="week-bar">
+    <select id="week-select" onchange="APP.switchWeek(this.value)"></select>
+    <span id="week-label"></span>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('list', this)">🛒 רשימה</div>
+  <div class="tab" onclick="switchTab('stats', this)">📊 סטטיסטיקות</div>
+  <div class="tab" onclick="switchTab('compare', this)">⚖️ השוואת מחיר</div>
+</div>
+
+<!-- LIST PANEL -->
+<div id="list-panel" class="panel active">
+  <div id="image-preview">
+    <img id="preview-img" src="" alt="">
+    <button onclick="clearImage()" style="display:block;margin-top:4px;background:var(--danger);color:#fff;border:none;border-radius:6px;padding:2px 8px;cursor:pointer;font-size:0.75rem">הסר תמונה</button>
+  </div>
+
+  <div class="add-bar">
+    <button class="icon-btn" id="voice-btn" onclick="APP.startVoice()" title="קלט קולי">🎙️</button>
+    <input type="text" id="item-input" placeholder="מוצר חדש..." onkeydown="if(event.key==='Enter') APP.addItem(document.getElementById('item-input').value, window._pendingImage)">
+    <label class="icon-btn" title="הוסף תמונה" style="cursor:pointer">
+      📷<input type="file" accept="image/*" style="display:none" onchange="handleImage(event)">
+    </label>
+    <button class="add-main-btn" onclick="APP.addItem(document.getElementById('item-input').value, window._pendingImage)">הוסף</button>
+  </div>
+
+  <div id="suggestions"></div>
+
+  <div class="list-meta">
+    <span id="item-count"></span>
+    <span id="total-price"></span>
+  </div>
+
+  <div id="items-list"></div>
+</div>
+
+<!-- STATS PANEL -->
+<div id="stats-panel" class="panel">
+  <p class="section-title">🧠 מה קונים הכי הרבה</p>
+  <div id="stats-content"></div>
+</div>
+
+<!-- COMPARE PANEL -->
+<div id="compare-panel" class="panel">
+  <p class="section-title">⚖️ מה יותר משתלם?</p>
+  <div class="compare-grid">
+    <div class="compare-col">
+      <div class="compare-col-title">מוצר א׳</div>
+      <label>משקל / נפח (גרם / מ"ל)</label>
+      <input type="number" id="p1-weight" placeholder="500">
+      <label>מחיר (₪)</label>
+      <input type="number" id="p1-price" placeholder="12.90">
+    </div>
+    <div class="compare-col">
+      <div class="compare-col-title">מוצר ב׳</div>
+      <label>משקל / נפח</label>
+      <input type="number" id="p2-weight" placeholder="1000">
+      <label>מחיר (₪)</label>
+      <input type="number" id="p2-price" placeholder="19.90">
+    </div>
+  </div>
+  <button class="compare-btn" onclick="APP.comparePrice()">השווה עכשיו 🔍</button>
+  <div id="compare-result"></div>
+</div>
+
+<!-- PRICE MODAL -->
+<div class="modal-overlay" id="price-modal" onclick="if(event.target===this) this.classList.remove('active')">
+  <div class="modal">
+    <h3>💰 כמה שילמת על <span id="price-item-name"></span>?</h3>
+    <input type="number" id="price-input-field" placeholder="מחיר ב-₪" onkeydown="if(event.key==='Enter') savePriceModal()">
+    <div class="modal-btns">
+      <button class="btn-primary" onclick="savePriceModal()">שמור</button>
+      <button class="btn-secondary" onclick="document.getElementById('price-modal').classList.remove('active')">דלג</button>
+    </div>
+  </div>
+</div>
+
+<!-- CONTEXT MODAL (long press) -->
+<div class="modal-overlay" id="context-modal" onclick="if(event.target===this) this.classList.remove('active')">
+  <div class="modal">
+    <h3>📦 <span id="ctx-item-name"></span></h3>
+    <button class="ctx-btn" onclick="ctxNextWeek()">📅 חסר — העבר לשבוע הבא</button>
+    <button class="ctx-btn danger" onclick="ctxDelete()">🗑 מחק מהרשימה</button>
+    <button class="ctx-btn" onclick="document.getElementById('context-modal').classList.remove('active')">ביטול</button>
+  </div>
+</div>
+
+<!-- IMAGE MODAL -->
+<div class="modal-overlay" id="img-modal" onclick="this.classList.remove('active')">
+  <div class="modal" style="background:transparent;border:none;max-width:90vw">
+    <img id="img-modal-img" src="" alt="">
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+  function switchTab(name, el) {
+    document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+    document.getElementById(name + '-panel').classList.add('active');
+    el.classList.add('active');
+    if (name === 'stats') APP.renderStats();
+  }
+
+  function handleImage(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      window._pendingImage = ev.target.result;
+      document.getElementById('preview-img').src = ev.target.result;
+      document.getElementById('image-preview').style.display = 'block';
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function clearImage() {
+    window._pendingImage = null;
+    document.getElementById('image-preview').style.display = 'none';
+    document.getElementById('preview-img').src = '';
+  }
+
+  function savePriceModal() {
+    const modal = document.getElementById('price-modal');
+    const price = document.getElementById('price-input-field').value;
+    APP.setPrice(modal.dataset.week, modal.dataset.id, price);
+    modal.classList.remove('active');
+    APP.showToast('✅ מחיר נשמר!');
+  }
+
+  function ctxNextWeek() {
+    const m = document.getElementById('context-modal');
+    APP.moveToNextWeek(m.dataset.week, m.dataset.id);
+    m.classList.remove('active');
+  }
+
+  function ctxDelete() {
+    const m = document.getElementById('context-modal');
+    APP.deleteItem(m.dataset.week, m.dataset.id);
+    m.classList.remove('active');
+  }
+</script>
+
+</body>
+</html>
