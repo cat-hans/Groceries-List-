@@ -1,0 +1,964 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>🛒 הסל שלנו</title>
+<link href="https://fonts.googleapis.com/css2?family=Rubik:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+import { getDatabase, ref, set, onValue } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js";
+
+const firebaseConfig = {
+  apiKey: "AIzaSyDug3fqhFWzZVE_tTw1ee1RFOdsARlRqNc",
+  authDomain: "grocery-list-dbbdd.firebaseapp.com",
+  databaseURL: "https://grocery-list-dbbdd-default-rtdb.firebaseio.com",
+  projectId: "grocery-list-dbbdd",
+  storageBucket: "grocery-list-dbbdd.firebasestorage.app",
+  messagingSenderId: "1079059037973",
+  appId: "1:1079059037973:web:0d281a9fcea0b227f6b31c"
+};
+
+function getWeekKey(date = new Date()) {
+  const d = new Date(date);
+  d.setHours(0,0,0,0);
+  d.setDate(d.getDate() - d.getDay());
+  return `week_${d.getFullYear()}_${String(d.getMonth()+1).padStart(2,'0')}_${String(d.getDate()).padStart(2,'0')}`;
+}
+function getWeekLabel(key) {
+  const p = key.replace('week_','').split('_');
+  const d = new Date(+p[0], +p[1]-1, +p[2]);
+  const e = new Date(d); e.setDate(d.getDate()+6);
+  const f = dt => `${dt.getDate()}/${dt.getMonth()+1}/${dt.getFullYear()}`;
+  return `${f(d)} – ${f(e)}`;
+}
+
+// ════════════════════════════════════════
+// DRAG — simple push-down/up, no jumping
+// ════════════════════════════════════════
+const DRAG = {
+  active: false,
+  dragEl: null,
+  ghost: null,
+  origIndex: 0,
+  startY: 0,
+  currentY: 0,
+
+  getItems() {
+    return [...document.querySelectorAll('#items-list .item-wrap[data-id]')];
+  },
+
+  start(el, clientY) {
+    const items = this.getItems();
+    this.origIndex = items.indexOf(el);
+    if (this.origIndex === -1) return;
+
+    this.active = true;
+    this.dragEl = el;
+    this.startY = clientY;
+    this.currentY = clientY;
+
+    // Visual: lift the element
+    el.classList.add('is-dragging');
+    document.body.style.overflow = 'hidden';
+    document.body.style.userSelect = 'none';
+  },
+
+  move(clientY) {
+    if (!this.active || !this.dragEl) return;
+    const dy = clientY - this.currentY;
+    this.currentY = clientY;
+
+    const items = this.getItems().filter(i => i !== this.dragEl);
+    const curIdx = this.getItems().indexOf(this.dragEl);
+
+    // Moving down
+    if (dy > 0 && curIdx < this.getItems().length - 1) {
+      const next = this.getItems()[curIdx + 1];
+      if (next) {
+        const nextRect = next.getBoundingClientRect();
+        const dragRect = this.dragEl.getBoundingClientRect();
+        if (dragRect.bottom > nextRect.top + nextRect.height * 0.5) {
+          next.after(this.dragEl);
+        }
+      }
+    }
+    // Moving up
+    if (dy < 0 && curIdx > 0) {
+      const prev = this.getItems()[curIdx - 1];
+      if (prev) {
+        const prevRect = prev.getBoundingClientRect();
+        const dragRect = this.dragEl.getBoundingClientRect();
+        if (dragRect.top < prevRect.bottom - prevRect.height * 0.5) {
+          prev.before(this.dragEl);
+        }
+      }
+    }
+
+    // Move the element visually with transform
+    const totalDy = clientY - this.startY;
+    this.dragEl.style.transform = `translateY(${totalDy}px)`;
+  },
+
+  async end() {
+    if (!this.active || !this.dragEl) return;
+    this.active = false;
+
+    // Snap back transform, element is already in new DOM position
+    this.dragEl.style.transform = '';
+    this.dragEl.classList.remove('is-dragging');
+    document.body.style.overflow = '';
+    document.body.style.userSelect = '';
+
+    // Save new order
+    const wk = APP.currentWeek;
+    this.getItems().forEach((w, i) => {
+      const id = w.dataset.id;
+      if (APP.items[wk]?.[id]) APP.items[wk][id].sortOrder = i * 1000;
+    });
+    this.dragEl = null;
+    await APP.saveData();
+  }
+};
+
+document.addEventListener('touchmove', e => {
+  if (DRAG.active) { e.preventDefault(); DRAG.move(e.touches[0].clientY); }
+}, { passive: false });
+document.addEventListener('touchend', () => { if (DRAG.active) DRAG.end(); });
+document.addEventListener('mousemove', e => { if (DRAG.active) DRAG.move(e.clientY); });
+document.addEventListener('mouseup', () => { if (DRAG.active) DRAG.end(); });
+
+// ════════════════════════════════════════
+// VOICE SHOPPING MODE
+// ════════════════════════════════════════
+window.SHOP = {
+  active: false,
+  items: [],
+  idx: 0,
+  rec: null,
+
+  speak(text) {
+    return new Promise(resolve => {
+      window.speechSynthesis.cancel();
+      const voices = window.speechSynthesis.getVoices();
+      const heVoice = voices.find(v => v.lang.startsWith('he')) || null;
+      const u = new SpeechSynthesisUtterance(text);
+      u.lang = 'he-IL';
+      u.rate = 0.92;
+      if (heVoice) u.voice = heVoice;
+      u.onend = resolve;
+      u.onerror = resolve;
+      window.speechSynthesis.speak(u);
+    });
+  },
+
+  async start() {
+    // Load voices (needed on iOS)
+    if (!window.speechSynthesis) {
+      APP.showToast('הדפדפן לא תומך בדיבור');
+      return;
+    }
+    const wk = APP.currentWeek;
+    this.items = Object.values(APP.items[wk] || {})
+      .filter(i => !i.done)
+      .sort((a,b) => (a.sortOrder||a.addedAt) - (b.sortOrder||b.addedAt));
+
+    if (!this.items.length) { APP.showToast('אין פריטים ברשימה'); return; }
+
+    this.active = true;
+    this.idx = 0;
+    document.getElementById('shop-mode-bar').style.display = 'flex';
+    document.getElementById('shop-status').textContent = '🎙️ מאזין...';
+
+    await this.readCurrent();
+  },
+
+  async readCurrent() {
+    if (!this.active) return;
+    if (this.idx >= this.items.length) {
+      document.getElementById('shop-current').textContent = '✅ סיום!';
+      document.getElementById('shop-status').textContent = '';
+      await this.speak('סיימנו! כל הכבוד!');
+      this.stop();
+      return;
+    }
+    const item = this.items[this.idx];
+    const label = item.name + (item.qty > 1 ? `, כמות ${item.qty}` : '');
+    document.getElementById('shop-current').textContent = item.name + (item.qty > 1 ? ` ×${item.qty}` : '');
+    document.getElementById('shop-status').textContent = '🔊 מקריא...';
+    await this.speak(label);
+    if (!this.active) return;
+    document.getElementById('shop-status').textContent = '🎙️ אמור "לקחתי" או "דלג"';
+    this.listen();
+  },
+
+  listen() {
+    if (!this.active) return;
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      APP.showToast('הדפדפן לא תומך בזיהוי קול');
+      return;
+    }
+    if (this.rec) { try { this.rec.abort(); } catch(e){} }
+    this.rec = new SR();
+    this.rec.lang = 'he-IL';
+    this.rec.interimResults = false;
+    this.rec.maxAlternatives = 3;
+
+    this.rec.onresult = async e => {
+      const results = [...e.results[0]].map(r => r.transcript.trim());
+      const said = results.join(' ');
+      console.log('heard:', said);
+      if (/לקחתי|לקחנו|יש|כן|אחד|אוקיי|אישור|יאללה|טוב|בסדר/.test(said)) {
+        document.getElementById('shop-status').textContent = '✅ מסומן!';
+        await APP.toggleDone(APP.currentWeek, this.items[this.idx].id);
+        this.idx++;
+        await this.readCurrent();
+      } else if (/דלג|הבא|לא|אין|פסח/.test(said)) {
+        this.idx++;
+        await this.readCurrent();
+      } else {
+        await this.speak('לא הבנתי, אמור לקחתי');
+        if (this.active) this.listen();
+      }
+    };
+    this.rec.onerror = e => {
+      console.log('rec error:', e.error);
+      if (!this.active) return;
+      if (e.error === 'no-speech') { this.listen(); return; }
+      setTimeout(() => { if (this.active) this.listen(); }, 500);
+    };
+    this.rec.onend = () => {
+      // If still active and no result handled, restart
+    };
+    try { this.rec.start(); } catch(e) { console.log(e); }
+  },
+
+  stop() {
+    this.active = false;
+    window.speechSynthesis.cancel();
+    if (this.rec) { try { this.rec.abort(); } catch(e){} this.rec = null; }
+    document.getElementById('shop-mode-bar').style.display = 'none';
+  }
+};
+
+// ════════════════════════════════════════
+// APP
+// ════════════════════════════════════════
+window.APP = {
+  db: null, currentWeek: null, items: {}, stats: {},
+
+  async init() {
+    this.currentWeek = getWeekKey();
+    try {
+      const app = initializeApp(firebaseConfig);
+      this.db = getDatabase(app);
+      onValue(ref(this.db, '/'), snap => {
+        const d = snap.val() || {};
+        this.items = d.items || {};
+        this.stats = d.stats || {};
+        this.saveLocal();
+        this.renderList();
+        this.renderWeekSelector();
+        this.renderStats();
+        this.checkSmartSuggestions();
+      });
+      document.getElementById('sync-badge').textContent = '☁️ מסונכרן';
+      document.getElementById('sync-badge').className = 'sync-badge online';
+    } catch(e) {
+      this.loadLocal();
+      document.getElementById('sync-badge').textContent = '💾 מקומי';
+      document.getElementById('sync-badge').className = 'sync-badge offline';
+    }
+    this.renderWeekSelector();
+  },
+
+  loadLocal() {
+    try {
+      const d = JSON.parse(localStorage.getItem('hasal_data')||'{}');
+      this.items = d.items||{}; this.stats = d.stats||{};
+    } catch(e){}
+    this.renderList(); this.renderStats(); this.checkSmartSuggestions();
+  },
+
+  saveLocal() {
+    localStorage.setItem('hasal_data', JSON.stringify({items:this.items, stats:this.stats}));
+  },
+
+  async saveData() {
+    if (this.db) {
+      await set(ref(this.db,'/'), {items:this.items, stats:this.stats});
+    } else {
+      this.saveLocal();
+      this.renderList(); this.renderStats(); this.checkSmartSuggestions();
+    }
+  },
+
+  async addItem(name, imageData=null, qty=1, weekKey=null) {
+    if (!name.trim()) return;
+    const wk = weekKey || this.currentWeek;
+    if (!this.items[wk]) this.items[wk] = {};
+    const id = 'item_'+Date.now()+'_'+Math.random().toString(36).slice(2,5);
+    const vals = Object.values(this.items[wk]);
+    const maxOrder = vals.length ? Math.max(...vals.map(i=>i.sortOrder||0)) : 0;
+    this.items[wk][id] = {
+      id, name:name.trim(), qty:qty||1,
+      done:false, price:null, image:imageData||null,
+      addedAt:Date.now(), sortOrder:maxOrder+1000, autoAdded:false
+    };
+    const key = name.trim().toLowerCase();
+    if (!this.stats[key]) this.stats[key]={count:0,weeks:[],lastAdded:null};
+    if (!this.stats[key].weeks.includes(wk)) this.stats[key].weeks.push(wk);
+    this.stats[key].count++;
+    this.stats[key].lastAdded = Date.now();
+    await this.saveData();
+    document.getElementById('item-input').value = '';
+    document.getElementById('qty-input').value = '';
+    document.getElementById('image-preview').style.display = 'none';
+    window._pendingImage = null;
+  },
+
+  async toggleDone(weekKey, id) {
+    const item = this.items[weekKey]?.[id];
+    if (!item) return;
+    item.done = !item.done;
+    await this.saveData();
+  },
+
+  async setPrice(weekKey, id, price) {
+    if (this.items[weekKey]?.[id]) {
+      this.items[weekKey][id].price = parseFloat(price)||null;
+      await this.saveData();
+    }
+  },
+
+  async updateItem(weekKey, id, name, qty) {
+    if (this.items[weekKey]?.[id] && name.trim()) {
+      this.items[weekKey][id].name = name.trim();
+      this.items[weekKey][id].qty = qty||1;
+      await this.saveData();
+    }
+  },
+
+  async moveToNextWeek(weekKey, id) {
+    const item = this.items[weekKey]?.[id]; if (!item) return;
+    const d = new Date(); d.setDate(d.getDate()+7);
+    const next = getWeekKey(d);
+    if (!this.items[next]) this.items[next] = {};
+    const newId = 'item_'+Date.now();
+    const vals = Object.values(this.items[next]);
+    const maxOrder = vals.length ? Math.max(...vals.map(i=>i.sortOrder||0)) : 0;
+    this.items[next][newId] = {...item, id:newId, done:false, price:null, addedAt:Date.now(), sortOrder:maxOrder+1000};
+    delete this.items[weekKey][id];
+    await this.saveData();
+    this.showToast('📅 הועבר לשבוע הבא!');
+  },
+
+  async deleteItem(weekKey, id) {
+    if (this.items[weekKey]?.[id]) {
+      delete this.items[weekKey][id];
+      await this.saveData();
+    }
+  },
+
+  renderList() {
+    const wk = this.currentWeek;
+    const items = this.items[wk]||{};
+    document.getElementById('week-label').textContent = getWeekLabel(wk);
+    const arr = Object.values(items).sort((a,b)=>(a.sortOrder||a.addedAt)-(b.sortOrder||b.addedAt));
+    const pending = arr.filter(i=>!i.done);
+    const done = arr.filter(i=>i.done);
+    const total = done.reduce((s,i)=>s+(i.price||0),0);
+    document.getElementById('total-price').textContent = total>0?`סה״כ: ₪${total.toFixed(2)}`:'';
+    document.getElementById('item-count').textContent = `${pending.length} פריטים`;
+    const list = document.getElementById('items-list');
+    list.innerHTML = '';
+    if (!arr.length) {
+      list.innerHTML = `<div class="empty-state"><div style="font-size:3rem">🛒</div><p>הרשימה ריקה</p></div>`;
+      return;
+    }
+    pending.forEach(item => list.appendChild(this.createItemEl(wk, item)));
+    if (done.length) {
+      const div = document.createElement('div');
+      div.className = 'divider-label';
+      div.textContent = `✓ נלקח (${done.length})`;
+      list.appendChild(div);
+      done.forEach(item => list.appendChild(this.createItemEl(wk, item)));
+    }
+  },
+
+  createItemEl(weekKey, item) {
+    const wrap = document.createElement('div');
+    wrap.className = 'item-wrap';
+    wrap.dataset.id = item.id;
+
+    const qty  = item.qty>1 ? `<span class="qty-badge">×${item.qty}</span>` : '';
+    const img  = item.image ? `<img src="${item.image}" class="item-thumb" onclick="event.stopPropagation();APP.showImage('${item.image}')">` : '';
+    const auto = item.autoAdded ? `<span class="auto-badge">🤖</span>` : '';
+
+    wrap.innerHTML = `
+      <div class="swipe-hint-left">📅 שבוע הבא</div>
+      <div class="swipe-hint-right">🗑 מחיקה</div>
+      <div class="item-card${item.done?' done':''}">
+        <div class="drag-handle">⠿</div>
+        ${img}
+        <div class="item-content">
+          <div class="item-top-row">
+            <span class="item-name">${item.name}</span>
+            ${qty}${auto}
+          </div>
+          ${item.done?'<span class="done-check">✓ נלקח</span>':''}
+        </div>
+        <div class="price-inline">
+          <span class="price-sym">₪</span>
+          <input type="number" class="price-input" placeholder="—"
+            value="${item.price||''}"
+            step="0.1" min="0">
+        </div>
+      </div>`;
+
+    const card   = wrap.querySelector('.item-card');
+    const hintL  = wrap.querySelector('.swipe-hint-left');
+    const hintR  = wrap.querySelector('.swipe-hint-right');
+    const handle = wrap.querySelector('.drag-handle');
+    const priceInput = wrap.querySelector('.price-input');
+
+    // Price save
+    priceInput.addEventListener('change', e => {
+      e.stopPropagation();
+      APP.setPrice(weekKey, item.id, e.target.value);
+    });
+    priceInput.addEventListener('click', e => e.stopPropagation());
+    priceInput.addEventListener('touchstart', e => e.stopPropagation(), {passive:true});
+
+    // Tap to toggle done (single tap, not on handle/price)
+    card.addEventListener('click', e => {
+      if (e.target.closest('.drag-handle') || e.target.closest('.price-input') || e.target.closest('.item-thumb')) return;
+      APP.toggleDone(weekKey, item.id);
+    });
+
+    // Double-tap / dblclick to edit
+    let lastTap = 0;
+    card.addEventListener('touchend', e => {
+      if (e.target.closest('.drag-handle') || e.target.closest('.price-input')) return;
+      const now = Date.now();
+      if (now - lastTap < 350) APP.openEdit(weekKey, item.id);
+      lastTap = now;
+    });
+    card.addEventListener('dblclick', e => {
+      if (e.target.closest('.drag-handle') || e.target.closest('.price-input')) return;
+      APP.openEdit(weekKey, item.id);
+    });
+
+    // Swipe left/right (skip if on handle or price)
+    let sx = 0, swipeActive = false;
+    card.addEventListener('touchstart', e => {
+      if (e.target.closest('.drag-handle') || e.target.closest('.price-input')) return;
+      sx = e.touches[0].clientX; swipeActive = true;
+      card.style.transition = 'none';
+    }, {passive:true});
+    card.addEventListener('touchmove', e => {
+      if (!swipeActive) return;
+      const dx = e.touches[0].clientX - sx;
+      card.style.transform = `translateX(${dx}px)`;
+      hintL.style.opacity = dx < -20 ? Math.min(1, Math.abs(dx)/80) : 0;
+      hintR.style.opacity = dx > 20  ? Math.min(1, dx/80) : 0;
+    }, {passive:true});
+    card.addEventListener('touchend', e => {
+      if (!swipeActive) return;
+      swipeActive = false;
+      const dx = parseFloat(card.style.transform.replace(/[^-\d.]/g,'')) || 0;
+      card.style.transition = 'transform 0.3s ease';
+      hintL.style.opacity = 0; hintR.style.opacity = 0;
+      if (dx < -80)      { card.style.transform='translateX(-120%)'; setTimeout(()=>APP.moveToNextWeek(weekKey,item.id),250); }
+      else if (dx > 80)  { card.style.transform='translateX(120%)';  setTimeout(()=>APP.deleteItem(weekKey,item.id),250); }
+      else               { card.style.transform='translateX(0)'; }
+    });
+
+    // Drag handle → vertical sort
+    handle.addEventListener('touchstart', e => {
+      e.stopPropagation();
+      DRAG.start(wrap, e.touches[0].clientY);
+    }, {passive:true});
+    handle.addEventListener('mousedown', e => {
+      e.stopPropagation();
+      DRAG.start(wrap, e.clientY);
+    });
+
+    return wrap;
+  },
+
+  openEdit(weekKey, id) {
+    const item = this.items[weekKey]?.[id]; if (!item) return;
+    document.getElementById('edit-name-input').value = item.name;
+    document.getElementById('edit-qty-input').value  = item.qty||1;
+    const modal = document.getElementById('edit-modal');
+    modal.dataset.week = weekKey;
+    modal.dataset.id   = id;
+    modal.classList.add('active');
+    setTimeout(()=>document.getElementById('edit-name-input').focus(), 100);
+  },
+
+  async saveEdit() {
+    const modal = document.getElementById('edit-modal');
+    const name = document.getElementById('edit-name-input').value.trim();
+    const qty  = parseInt(document.getElementById('edit-qty-input').value)||1;
+    await this.updateItem(modal.dataset.week, modal.dataset.id, name, qty);
+    modal.classList.remove('active');
+  },
+
+  showImage(src) {
+    document.getElementById('img-modal-img').src = src;
+    document.getElementById('img-modal').classList.add('active');
+  },
+
+  renderWeekSelector() {
+    const d2 = new Date(); d2.setDate(d2.getDate()+7);
+    const all = [...new Set([getWeekKey(), getWeekKey(d2), ...Object.keys(this.items)])].sort().reverse();
+    const sel = document.getElementById('week-select');
+    const cur = this.currentWeek;
+    sel.innerHTML = '';
+    all.forEach(wk => {
+      const o = document.createElement('option');
+      o.value = wk; o.textContent = getWeekLabel(wk);
+      if (wk === cur) o.selected = true;
+      sel.appendChild(o);
+    });
+  },
+
+  switchWeek(wk) { this.currentWeek = wk; this.renderList(); this.checkSmartSuggestions(); },
+
+  checkSmartSuggestions() {
+    const wk = this.currentWeek;
+    const curNames = Object.values(this.items[wk]||{}).map(i=>i.name.toLowerCase());
+    const now = Date.now(); const sugg = [];
+    Object.entries(this.stats).forEach(([name,stat]) => {
+      if (stat.count < 2 || curNames.includes(name)) return;
+      const avgWeeks = stat.weeks.length > 1 ? (stat.weeks.length-1)/(stat.count-1) : 3;
+      const daysSince = stat.lastAdded ? (now-stat.lastAdded)/86400000 : 999;
+      if (daysSince >= avgWeeks*7*0.8) sugg.push({name, days:Math.round(avgWeeks*7), since:Math.round(daysSince)});
+    });
+    const c = document.getElementById('suggestions');
+    if (!sugg.length) { c.style.display='none'; return; }
+    c.style.display = 'block';
+    c.innerHTML = `<div class="sugg-title">🤖 הסל הזכור — הגיע הזמן:</div>` +
+      sugg.slice(0,5).map(s=>`
+        <div class="sugg-chip" onclick="APP.addItem('${s.name}');APP.showToast('✅ נוסף!')">
+          <span>${s.name}</span><small>~כל ${s.days} יום</small>
+          <span class="chip-plus">+</span>
+        </div>`).join('');
+    sugg.filter(s=>s.since>=s.days*2).forEach(s=>{
+      const already = Object.values(this.items[wk]||{}).some(i=>i.name.toLowerCase()===s.name&&i.autoAdded);
+      if (!already) this.addAutoItem(s.name, wk);
+    });
+  },
+
+  async addAutoItem(name, wk) {
+    if (!this.items[wk]) this.items[wk] = {};
+    const id = 'auto_'+Date.now();
+    const vals = Object.values(this.items[wk]);
+    const maxOrder = vals.length ? Math.max(...vals.map(i=>i.sortOrder||0)) : 0;
+    this.items[wk][id] = {id,name,qty:1,done:false,price:null,image:null,addedAt:Date.now(),sortOrder:maxOrder+1000,autoAdded:true};
+    await this.saveData();
+    this.showToast(`🤖 הסל הזכור הוסיף: ${name}`);
+  },
+
+  renderStats() {
+    const c = document.getElementById('stats-content');
+    const entries = Object.entries(this.stats)
+      .filter(([,s])=>s.count>=1)
+      .map(([name,s])=>({name,count:s.count,avg:s.weeks.length>1?Math.round((s.weeks.length-1)/(s.count-1)*7):'?'}))
+      .sort((a,b)=>b.count-a.count).slice(0,20);
+    if (!entries.length) { c.innerHTML='<p class="stats-empty">עדיין אין נתונים 📊</p>'; return; }
+    c.innerHTML = `<div class="stats-hdr"><span>מוצר</span><span>ממוצע</span><span>פעמים</span></div>` +
+      entries.map(e=>`<div class="stat-row">
+        <span class="stat-name">${e.name}</span>
+        <span class="stat-avg">${e.avg==='?'?'—':`~${e.avg} ימים`}</span>
+        <span class="stat-cnt">${e.count}×</span>
+      </div>`).join('');
+  },
+
+  comparePrice() {
+    const w1=parseFloat(document.getElementById('p1-weight').value);
+    const p1=parseFloat(document.getElementById('p1-price').value);
+    const w2=parseFloat(document.getElementById('p2-weight').value);
+    const p2=parseFloat(document.getElementById('p2-price').value);
+    if (!w1||!p1||!w2||!p2) { this.showToast('⚠️ מלא את כל השדות'); return; }
+    const u1=p1/w1, u2=p2/w2;
+    const res = document.getElementById('compare-result');
+    if (u1<u2) { const pct=(((u2-u1)/u2)*100).toFixed(1); res.innerHTML=`<div class="cmp-win">🏆 מוצר א׳ זול ב-<strong>${pct}%</strong></div><div class="cmp-det">₪${u1.toFixed(3)} ליח׳ לעומת ₪${u2.toFixed(3)} ליח׳</div>`; }
+    else if (u2<u1) { const pct=(((u1-u2)/u1)*100).toFixed(1); res.innerHTML=`<div class="cmp-win">🏆 מוצר ב׳ זול ב-<strong>${pct}%</strong></div><div class="cmp-det">₪${u2.toFixed(3)} ליח׳ לעומת ₪${u1.toFixed(3)} ליח׳</div>`; }
+    else res.innerHTML=`<div class="cmp-win">🤝 זהים!</div>`;
+  },
+
+  showToast(msg) {
+    const t = document.getElementById('toast');
+    t.textContent = msg; t.className='toast active';
+    setTimeout(()=>t.className='toast',2500);
+  }
+};
+
+window.addEventListener('DOMContentLoaded', () => window.APP.init());
+</script>
+
+<style>
+:root{--bg:#0f1117;--surf:#1a1d27;--surf2:#22263a;--acc:#4ade80;--acc2:#38bdf8;--danger:#f87171;--txt:#f1f5f9;--txt2:#94a3b8;--bdr:#2d3249;--r:16px;}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+body{font-family:'Rubik',sans-serif;background:var(--bg);color:var(--txt);min-height:100vh;direction:rtl;}
+/* HEADER */
+.header{background:var(--surf);border-bottom:1px solid var(--bdr);padding:14px 16px 10px;position:sticky;top:0;z-index:100;}
+.header-top{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;}
+.app-title{font-size:1.4rem;font-weight:900;}.app-title span{color:var(--acc);}
+.sync-badge{font-size:0.7rem;padding:3px 8px;border-radius:20px;}
+.sync-badge.online{background:rgba(74,222,128,0.15);color:var(--acc);}
+.sync-badge.offline{background:rgba(148,163,184,0.15);color:var(--txt2);}
+.week-bar{display:flex;align-items:center;gap:8px;}
+#week-select{background:var(--surf2);color:var(--txt);border:1px solid var(--bdr);border-radius:8px;padding:6px 10px;font-family:inherit;font-size:0.8rem;flex:1;}
+/* TABS */
+.tabs{display:flex;border-bottom:1px solid var(--bdr);background:var(--surf);}
+.tab{flex:1;padding:11px;text-align:center;font-size:0.78rem;cursor:pointer;border-bottom:2px solid transparent;color:var(--txt2);font-weight:500;}
+.tab.active{color:var(--acc);border-bottom-color:var(--acc);}
+/* SHOP BAR */
+.shop-bar{display:none;align-items:center;gap:10px;background:#0d1f0d;border-bottom:2px solid var(--acc);padding:12px 16px;}
+.shop-bar-inner{flex:1;}
+.shop-bar-label{font-size:0.68rem;color:var(--acc);font-weight:700;letter-spacing:1px;text-transform:uppercase;}
+#shop-current{font-size:1.1rem;font-weight:700;margin-top:2px;}
+#shop-status{font-size:0.75rem;color:var(--txt2);margin-top:2px;}
+.shop-stop-btn{background:var(--danger);color:#fff;border:none;border-radius:10px;padding:8px 14px;font-family:inherit;font-weight:700;cursor:pointer;}
+/* PANELS */
+.panel{display:none;padding:14px;max-width:600px;margin:0 auto;}
+.panel.active{display:block;}
+/* ADD */
+.add-bar{display:flex;gap:8px;background:var(--surf);border:1px solid var(--bdr);border-radius:var(--r);padding:8px;align-items:center;margin-bottom:8px;}
+.add-bar input[type=text]{flex:1;background:transparent;border:none;color:var(--txt);font-family:inherit;font-size:1rem;outline:none;}
+.add-bar input::placeholder{color:var(--txt2);}
+.add-main-btn{background:var(--acc);color:#000;border:none;cursor:pointer;border-radius:10px;padding:8px 14px;font-weight:700;font-size:0.9rem;font-family:inherit;}
+.qty-bar{display:flex;align-items:center;gap:8px;margin-bottom:10px;}
+.qty-bar label{font-size:0.78rem;color:var(--txt2);margin:0;}
+.qty-bar input{background:var(--surf2);border:1px solid var(--bdr);color:var(--txt);border-radius:8px;padding:5px 10px;font-family:inherit;font-size:0.9rem;width:60px;text-align:center;outline:none;}
+/* IMAGE AREA */
+.img-row{display:flex;gap:8px;margin-bottom:10px;}
+.img-btn{flex:1;background:var(--surf2);border:1px solid var(--bdr);color:var(--txt);border-radius:10px;padding:9px;font-family:inherit;font-size:0.82rem;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:6px;}
+#image-preview{display:none;margin-bottom:10px;position:relative;width:fit-content;}
+#image-preview img{width:72px;height:72px;object-fit:cover;border-radius:10px;border:2px solid var(--acc);}
+#image-preview .remove-img{position:absolute;top:-6px;left:-6px;background:var(--danger);color:#fff;border:none;border-radius:50%;width:20px;height:20px;cursor:pointer;font-size:0.75rem;display:flex;align-items:center;justify-content:center;}
+/* SHOP BTN */
+.shop-start-btn{width:100%;background:linear-gradient(135deg,#166534,#0e4429);border:1px solid var(--acc);color:var(--acc);border-radius:var(--r);padding:13px;font-family:inherit;font-weight:700;font-size:1rem;cursor:pointer;margin-bottom:14px;display:flex;align-items:center;justify-content:center;gap:8px;}
+.shop-start-btn:active{opacity:0.8;}
+/* SUGGESTIONS */
+#suggestions{display:none;margin-bottom:12px;}
+.sugg-title{font-size:0.75rem;color:var(--txt2);margin-bottom:8px;}
+.sugg-chip{display:inline-flex;align-items:center;gap:6px;background:var(--surf2);border:1px solid var(--bdr);border-radius:20px;padding:5px 10px;margin:3px;cursor:pointer;font-size:0.8rem;}
+.chip-plus{background:var(--acc);color:#000;border-radius:50%;width:18px;height:18px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:0.75rem;flex-shrink:0;}
+/* LIST META */
+.list-meta{display:flex;justify-content:space-between;margin-bottom:10px;}
+#item-count{font-size:0.78rem;color:var(--txt2);}
+#total-price{font-size:0.88rem;color:var(--acc);font-weight:700;}
+/* ITEMS */
+.item-wrap{position:relative;margin-bottom:8px;overflow:hidden;border-radius:var(--r);}
+.swipe-hint-left,.swipe-hint-right{position:absolute;top:0;bottom:0;display:flex;align-items:center;padding:0 18px;font-size:0.8rem;font-weight:700;opacity:0;pointer-events:none;z-index:0;border-radius:var(--r);}
+.swipe-hint-left{right:0;background:linear-gradient(to left,rgba(56,189,248,.3),transparent);color:var(--acc2);}
+.swipe-hint-right{left:0;background:linear-gradient(to right,rgba(248,113,113,.3),transparent);color:var(--danger);}
+.item-card{position:relative;z-index:1;display:flex;align-items:center;gap:8px;background:var(--surf);border:1px solid var(--bdr);border-radius:var(--r);padding:11px 10px;cursor:pointer;animation:sIn .2s ease;transition:box-shadow .2s;}
+@keyframes sIn{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+.item-card.done{opacity:0.5;}
+.item-wrap.is-dragging .item-card{box-shadow:0 8px 30px rgba(0,0,0,.6);opacity:0.9;border-color:var(--acc);z-index:50;position:relative;}
+.drag-handle{font-size:1.1rem;color:var(--txt2);cursor:grab;padding:0 4px;flex-shrink:0;touch-action:none;letter-spacing:-1px;line-height:1;user-select:none;}
+.drag-handle:active{cursor:grabbing;color:var(--acc);}
+.item-thumb{width:40px;height:40px;object-fit:cover;border-radius:8px;flex-shrink:0;}
+.item-content{flex:1;min-width:0;}
+.item-top-row{display:flex;align-items:center;gap:5px;flex-wrap:wrap;}
+.item-name{font-size:0.95rem;font-weight:500;}
+.item-card.done .item-name{text-decoration:line-through;color:var(--txt2);}
+.done-check{font-size:0.72rem;color:var(--acc);font-weight:700;display:block;margin-top:2px;}
+.qty-badge{background:var(--acc2);color:#000;border-radius:10px;padding:1px 7px;font-size:0.72rem;font-weight:700;flex-shrink:0;}
+.auto-badge{font-size:0.8rem;}
+.price-inline{display:flex;align-items:center;gap:2px;flex-shrink:0;}
+.price-sym{font-size:0.72rem;color:var(--txt2);}
+.price-input{width:54px;background:var(--surf2);border:1px solid var(--bdr);color:var(--acc);border-radius:8px;padding:4px 5px;font-family:inherit;font-size:0.8rem;font-weight:700;text-align:center;outline:none;cursor:text;}
+.price-input:focus{border-color:var(--acc);}
+.divider-label{font-size:0.75rem;color:var(--txt2);padding:8px 4px 4px;}
+.empty-state{text-align:center;padding:40px 20px;color:var(--txt2);}
+/* STATS */
+.stats-hdr{display:flex;gap:8px;font-size:0.7rem;color:var(--txt2);font-weight:700;padding-bottom:6px;border-bottom:1px solid var(--bdr);margin-bottom:8px;}
+.stats-hdr span:first-child{flex:1;}
+.stat-row{display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid rgba(45,50,73,.5);}
+.stat-name{flex:1;font-size:0.85rem;}
+.stat-avg{font-size:0.75rem;color:var(--txt2);min-width:80px;}
+.stat-cnt{font-size:0.8rem;color:var(--acc);font-weight:700;min-width:30px;text-align:left;}
+.stats-empty{color:var(--txt2);font-size:0.9rem;padding:20px 0;}
+/* COMPARE */
+.cmp-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:14px;}
+.cmp-col{background:var(--surf2);border-radius:12px;padding:14px;}
+.cmp-col-title{font-size:0.75rem;color:var(--txt2);margin-bottom:10px;font-weight:700;}
+.cmp-col input{width:100%;background:var(--surf);border:1px solid var(--bdr);color:var(--txt);border-radius:8px;padding:8px 10px;font-family:inherit;font-size:0.9rem;margin-bottom:8px;direction:rtl;outline:none;}
+.cmp-btn{width:100%;background:var(--acc2);color:#000;border:none;border-radius:10px;padding:11px;font-weight:700;font-size:0.95rem;cursor:pointer;font-family:inherit;margin-bottom:14px;}
+.cmp-win{font-size:1.1rem;font-weight:700;text-align:center;margin-bottom:6px;}
+.cmp-det{font-size:0.8rem;color:var(--txt2);text-align:center;}
+/* MODALS */
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:1000;display:none;align-items:center;justify-content:center;backdrop-filter:blur(4px);padding:20px;}
+.modal-overlay.active{display:flex;}
+.modal{background:var(--surf);border:1px solid var(--bdr);border-radius:20px;padding:22px;width:100%;max-width:340px;animation:pop .2s ease;}
+@keyframes pop{from{transform:scale(.9);opacity:0}to{transform:scale(1);opacity:1}}
+.modal h3{font-size:1rem;margin-bottom:14px;}
+.modal-input{width:100%;background:var(--surf2);border:1px solid var(--bdr);color:var(--txt);border-radius:10px;padding:10px 14px;font-family:inherit;font-size:1rem;margin-bottom:10px;direction:rtl;outline:none;}
+.modal-input:focus{border-color:var(--acc);}
+.modal-btns{display:flex;gap:8px;}
+.btn-pri{flex:1;background:var(--acc);color:#000;border:none;border-radius:10px;padding:11px;font-weight:700;cursor:pointer;font-family:inherit;}
+.btn-sec{flex:1;background:var(--surf2);color:var(--txt);border:1px solid var(--bdr);border-radius:10px;padding:11px;cursor:pointer;font-family:inherit;}
+/* IMAGE SEARCH MODAL */
+.img-search-bar{display:flex;gap:8px;margin-bottom:12px;}
+.img-search-bar input{flex:1;background:var(--surf2);border:1px solid var(--bdr);color:var(--txt);border-radius:10px;padding:9px 12px;font-family:inherit;font-size:0.95rem;outline:none;}
+.img-search-bar input:focus{border-color:var(--acc2);}
+.img-search-go{background:var(--acc2);color:#000;border:none;border-radius:10px;padding:9px 14px;font-weight:700;cursor:pointer;font-family:inherit;}
+.img-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;max-height:320px;overflow-y:auto;}
+.img-grid img{width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px;cursor:pointer;border:2px solid transparent;transition:border-color .2s;}
+.img-grid img:hover,.img-grid img.selected{border-color:var(--acc);}
+.img-grid-empty{grid-column:1/-1;text-align:center;color:var(--txt2);padding:20px;font-size:0.85rem;}
+#img-modal-img{max-width:100%;max-height:70vh;object-fit:contain;border-radius:12px;display:block;margin:0 auto;}
+/* TOAST */
+.toast{position:fixed;bottom:70px;left:50%;transform:translateX(-50%) translateY(20px);background:var(--surf);border:1px solid var(--bdr);padding:10px 20px;border-radius:20px;font-size:0.88rem;opacity:0;transition:all .3s;z-index:2000;pointer-events:none;white-space:nowrap;}
+.toast.active{opacity:1;transform:translateX(-50%) translateY(0);}
+label{font-size:0.78rem;color:var(--txt2);display:block;margin-bottom:4px;}
+@media(max-width:400px){.cmp-grid{grid-template-columns:1fr;}}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="header-top">
+    <div class="app-title">🛒 הסל <span>שלנו</span></div>
+    <span id="sync-badge" class="sync-badge offline">טוען...</span>
+  </div>
+  <div class="week-bar">
+    <select id="week-select" onchange="APP.switchWeek(this.value)"></select>
+    <span id="week-label"></span>
+  </div>
+</div>
+
+<!-- SHOP MODE BAR -->
+<div id="shop-mode-bar" class="shop-bar">
+  <div class="shop-bar-inner">
+    <div class="shop-bar-label">🛒 מצב קניה קולית</div>
+    <div id="shop-current">...</div>
+    <div id="shop-status"></div>
+  </div>
+  <button class="shop-stop-btn" onclick="SHOP.stop()">עצור</button>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('list',this)">🛒 רשימה</div>
+  <div class="tab" onclick="switchTab('stats',this)">📊 סטטיסטיקות</div>
+  <div class="tab" onclick="switchTab('compare',this)">⚖️ השוואה</div>
+</div>
+
+<!-- LIST -->
+<div id="list-panel" class="panel active">
+  <div class="add-bar">
+    <input type="text" id="item-input" placeholder="מוצר חדש..." onkeydown="if(event.key==='Enter')doAdd()">
+    <button class="add-main-btn" onclick="doAdd()">הוסף</button>
+  </div>
+  <div class="qty-bar">
+    <label style="margin:0">כמות:</label>
+    <input type="number" id="qty-input" placeholder="1" min="1" max="99">
+  </div>
+
+  <!-- Image buttons -->
+  <div id="image-preview">
+    <img id="preview-img" src="" alt="">
+    <button class="remove-img" onclick="clearImage()">✕</button>
+  </div>
+  <div class="img-row">
+    <label class="img-btn">
+      📁 העלה תמונה
+      <input type="file" accept="image/*" style="display:none" onchange="handleImageFile(event)">
+    </label>
+    <button class="img-btn" onclick="openImageSearch()">🔍 חפש ברשת</button>
+  </div>
+
+  <button class="shop-start-btn" onclick="SHOP.start()">🎙️ התחל קניה קולית</button>
+
+  <div id="suggestions"></div>
+  <div class="list-meta">
+    <span id="item-count"></span>
+    <span id="total-price"></span>
+  </div>
+  <div id="items-list"></div>
+</div>
+
+<!-- STATS -->
+<div id="stats-panel" class="panel">
+  <p style="font-size:1rem;font-weight:700;margin-bottom:6px">📊 דפוסי הקנייה שלי</p>
+  <p style="font-size:0.78rem;color:var(--txt2);margin-bottom:14px">הסל לומד מתי אתה קונה כל מוצר ומציע אוטומטית</p>
+  <div id="stats-content"></div>
+</div>
+
+<!-- COMPARE -->
+<div id="compare-panel" class="panel">
+  <p style="font-size:1rem;font-weight:700;margin-bottom:14px">⚖️ מה יותר משתלם?</p>
+  <div class="cmp-grid">
+    <div class="cmp-col">
+      <div class="cmp-col-title">מוצר א׳</div>
+      <label>משקל/נפח (גרם/מ״ל)</label>
+      <input type="number" id="p1-weight" placeholder="500">
+      <label>מחיר (₪)</label>
+      <input type="number" id="p1-price" placeholder="12.90">
+    </div>
+    <div class="cmp-col">
+      <div class="cmp-col-title">מוצר ב׳</div>
+      <label>משקל/נפח</label>
+      <input type="number" id="p2-weight" placeholder="1000">
+      <label>מחיר (₪)</label>
+      <input type="number" id="p2-price" placeholder="19.90">
+    </div>
+  </div>
+  <button class="cmp-btn" onclick="APP.comparePrice()">השווה עכשיו 🔍</button>
+  <div id="compare-result"></div>
+</div>
+
+<!-- EDIT MODAL -->
+<div class="modal-overlay" id="edit-modal" onclick="if(event.target===this)this.classList.remove('active')">
+  <div class="modal">
+    <h3>✏️ עריכת מוצר</h3>
+    <input class="modal-input" type="text" id="edit-name-input" placeholder="שם מוצר" onkeydown="if(event.key==='Enter')APP.saveEdit()">
+    <label>כמות</label>
+    <input class="modal-input" type="number" id="edit-qty-input" placeholder="1" min="1" max="99">
+    <div class="modal-btns">
+      <button class="btn-pri" onclick="APP.saveEdit()">שמור</button>
+      <button class="btn-sec" onclick="document.getElementById('edit-modal').classList.remove('active')">ביטול</button>
+    </div>
+  </div>
+</div>
+
+<!-- IMAGE SEARCH MODAL -->
+<div class="modal-overlay" id="img-search-modal" onclick="if(event.target===this)this.classList.remove('active')">
+  <div class="modal" style="max-width:400px">
+    <h3>🔍 חפש תמונה ברשת</h3>
+    <div class="img-search-bar">
+      <input type="text" id="img-search-input" placeholder="למשל: קורנפלקס תלמה"
+        onkeydown="if(event.key==='Enter')searchImages()">
+      <button class="img-search-go" onclick="searchImages()">חפש</button>
+    </div>
+    <div id="img-grid" class="img-grid">
+      <div class="img-grid-empty">הקלד מוצר ולחץ חפש</div>
+    </div>
+    <div style="margin-top:12px;display:flex;gap:8px;">
+      <button class="btn-pri" id="img-select-btn" style="display:none" onclick="confirmImageSearch()">בחר תמונה</button>
+      <button class="btn-sec" onclick="document.getElementById('img-search-modal').classList.remove('active')">סגור</button>
+    </div>
+  </div>
+</div>
+
+<!-- VIEW IMAGE MODAL -->
+<div class="modal-overlay" id="img-modal" onclick="this.classList.remove('active')">
+  <div class="modal" style="background:transparent;border:none;max-width:90vw">
+    <img id="img-modal-img" src="" alt="">
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script>
+function switchTab(name, el) {
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.getElementById(name+'-panel').classList.add('active');
+  el.classList.add('active');
+  if (name==='stats') APP.renderStats();
+}
+
+function doAdd() {
+  const name = document.getElementById('item-input').value.trim();
+  const qty  = parseInt(document.getElementById('qty-input').value)||1;
+  if (name) APP.addItem(name, window._pendingImage, qty);
+}
+
+function handleImageFile(e) {
+  const file = e.target.files[0]; if (!file) return;
+  const r = new FileReader();
+  r.onload = ev => {
+    window._pendingImage = ev.target.result;
+    document.getElementById('preview-img').src = ev.target.result;
+    document.getElementById('image-preview').style.display = 'block';
+  };
+  r.readAsDataURL(file);
+}
+
+function clearImage() {
+  window._pendingImage = null;
+  document.getElementById('image-preview').style.display = 'none';
+  document.getElementById('preview-img').src = '';
+}
+
+// Image search via Unsplash API (free, no key needed for source.unsplash.com)
+let selectedImgUrl = null;
+
+function openImageSearch() {
+  const name = document.getElementById('item-input').value.trim();
+  if (name) document.getElementById('img-search-input').value = name;
+  document.getElementById('img-search-modal').classList.add('active');
+  document.getElementById('img-grid').innerHTML = '<div class="img-grid-empty">הקלד מוצר ולחץ חפש</div>';
+  document.getElementById('img-select-btn').style.display = 'none';
+  selectedImgUrl = null;
+  if (name) searchImages();
+}
+
+async function searchImages() {
+  const q = document.getElementById('img-search-input').value.trim();
+  if (!q) return;
+  const grid = document.getElementById('img-grid');
+  grid.innerHTML = '<div class="img-grid-empty">מחפש...</div>';
+  selectedImgUrl = null;
+  document.getElementById('img-select-btn').style.display = 'none';
+
+  // Use Unsplash source for random product images
+  const terms = encodeURIComponent(q);
+  const imgs = Array.from({length:9}, (_,i) =>
+    `https://source.unsplash.com/150x150/?${terms}&sig=${i+Date.now()}`
+  );
+
+  grid.innerHTML = '';
+  imgs.forEach(url => {
+    const img = document.createElement('img');
+    img.src = url;
+    img.loading = 'lazy';
+    img.onerror = () => img.remove();
+    img.onclick = () => {
+      grid.querySelectorAll('img').forEach(i=>i.classList.remove('selected'));
+      img.classList.add('selected');
+      selectedImgUrl = url;
+      document.getElementById('img-select-btn').style.display = 'block';
+    };
+    grid.appendChild(img);
+  });
+}
+
+async function confirmImageSearch() {
+  if (!selectedImgUrl) return;
+  // Convert to base64 via canvas
+  try {
+    const res = await fetch(selectedImgUrl);
+    const blob = await res.blob();
+    const reader = new FileReader();
+    reader.onload = ev => {
+      window._pendingImage = ev.target.result;
+      document.getElementById('preview-img').src = ev.target.result;
+      document.getElementById('image-preview').style.display = 'block';
+      document.getElementById('img-search-modal').classList.remove('active');
+      APP.showToast('✅ תמונה נבחרה!');
+    };
+    reader.readAsDataURL(blob);
+  } catch(e) {
+    // fallback: use URL directly
+    window._pendingImage = selectedImgUrl;
+    document.getElementById('preview-img').src = selectedImgUrl;
+    document.getElementById('image-preview').style.display = 'block';
+    document.getElementById('img-search-modal').classList.remove('active');
+    APP.showToast('✅ תמונה נבחרה!');
+  }
+}
+</script>
+</body>
+</html>
