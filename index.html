@@ -1,0 +1,690 @@
+<!DOCTYPE html>
+<html lang="he" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>🛒 הסל שלנו</title>
+<link href="https://fonts.googleapis.com/css2?family=Rubik:wght@300;400;500;700;900&display=swap" rel="stylesheet">
+<script type="module">
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-app.js";
+import { getDatabase, ref, set, onValue } from "https://www.gstatic.com/firebasejs/10.7.1/firebase-database.js";
+const FB={apiKey:"AIzaSyDug3fqhFWzZVE_tTw1ee1RFOdsARlRqNc",authDomain:"grocery-list-dbbdd.firebaseapp.com",databaseURL:"https://grocery-list-dbbdd-default-rtdb.firebaseio.com",projectId:"grocery-list-dbbdd",storageBucket:"grocery-list-dbbdd.firebasestorage.app",messagingSenderId:"1079059037973",appId:"1:1079059037973:web:0d281a9fcea0b227f6b31c"};
+
+function wKey(d=new Date()){const x=new Date(d);x.setHours(0,0,0,0);x.setDate(x.getDate()-x.getDay());return`week_${x.getFullYear()}_${String(x.getMonth()+1).padStart(2,'0')}_${String(x.getDate()).padStart(2,'0')}`;}
+function wLabel(k){const p=k.replace('week_','').split('_');const d=new Date(+p[0],+p[1]-1,+p[2]);const e=new Date(d);e.setDate(d.getDate()+6);const f=x=>`${x.getDate()}/${x.getMonth()+1}/${x.getFullYear()}`;return`${f(d)} – ${f(e)}`;}
+
+/* ─────────────────────────────
+   DRAG — snapshot positions at start,
+   only move dragged element visually,
+   reorder DOM once at drop
+───────────────────────────── */
+const DRAG={
+  el:null, snaps:[], startY:0, deltaY:0,
+
+  pendingItems(){return[...document.querySelectorAll('#list .iw:not(.iw-done)')];},
+
+  start(el,y){
+    this.el=el; this.startY=y; this.deltaY=0;
+    // Snapshot positions NOW — never changes during drag
+    this.snaps=this.pendingItems().map(w=>{const r=w.getBoundingClientRect();return{el:w,mid:r.top+r.height/2};});
+    el.classList.add('dragging');
+    document.body.style.overflow='hidden';
+  },
+
+  move(y){
+    if(!this.el)return;
+    this.deltaY=y-this.startY;
+    this.el.style.transform=`translateY(${this.deltaY}px)`;
+    // Highlight drop target using SNAPSHOT positions
+    const fingerY=y;
+    const myIdx=this.snaps.findIndex(s=>s.el===this.el);
+    let tgt=myIdx;
+    for(let i=0;i<this.snaps.length;i++){
+      if(i===myIdx)continue;
+      if(fingerY<this.snaps[i].mid){tgt=i;break;}
+      tgt=i;
+    }
+    this.snaps.forEach((s,i)=>{
+      if(s.el!==this.el) s.el.classList.toggle('drag-tgt',i===tgt);
+    });
+  },
+
+  async end(){
+    if(!this.el)return;
+    const myIdx=this.snaps.findIndex(s=>s.el===this.el);
+    const fingerY=this.startY+this.deltaY;
+    let tgt=myIdx;
+    for(let i=0;i<this.snaps.length;i++){
+      if(this.snaps[i].el===this.el)continue;
+      if(fingerY<this.snaps[i].mid){tgt=i;break;}
+      if(i>myIdx)tgt=i;
+    }
+
+    this.el.style.transform='';
+    this.el.classList.remove('dragging');
+    this.snaps.forEach(s=>s.el.classList.remove('drag-tgt'));
+    document.body.style.overflow='';
+
+    if(tgt!==myIdx){
+      // Reorder: build new array, then insert into DOM
+      const arr=this.snaps.map(s=>s.el);
+      arr.splice(myIdx,1);
+      arr.splice(tgt<myIdx?tgt:tgt,0,this.el);
+      const list=document.getElementById('list');
+      const div=list.querySelector('.dlbl');
+      arr.forEach(el=>list.insertBefore(el,div||null));
+      // Save sortOrder
+      const wk=APP.cw;
+      arr.forEach((w,i)=>{const id=w.dataset.id;if(APP.items[wk]?.[id])APP.items[wk][id].sortOrder=i*1000;});
+      await APP.save();
+    }
+    this.el=null; this.snaps=[];
+  }
+};
+document.addEventListener('touchmove',e=>{if(DRAG.el){e.preventDefault();DRAG.move(e.touches[0].clientY);}},{passive:false});
+document.addEventListener('touchend',()=>{if(DRAG.el)DRAG.end();});
+document.addEventListener('mousemove',e=>{if(DRAG.el)DRAG.move(e.clientY);});
+document.addEventListener('mouseup',()=>{if(DRAG.el)DRAG.end();});
+
+/* ─────────────────────────────
+   VOICE SHOPPING
+   Primary: buttons. Secondary: voice recognition.
+───────────────────────────── */
+window.SHOP={
+  on:false, items:[], idx:0, rec:null,
+
+  speak(txt){
+    return new Promise(ok=>{
+      speechSynthesis.cancel();
+      const u=new SpeechSynthesisUtterance(txt);
+      u.lang='he-IL'; u.rate=0.88;
+      const v=speechSynthesis.getVoices().find(x=>x.lang.startsWith('he'));
+      if(v)u.voice=v;
+      u.onend=ok; u.onerror=ok;
+      // iOS workaround: resume if suspended
+      if(speechSynthesis.paused)speechSynthesis.resume();
+      speechSynthesis.speak(u);
+    });
+  },
+
+  async start(){
+    const wk=APP.cw;
+    this.items=Object.values(APP.items[wk]||{}).filter(i=>!i.done).sort((a,b)=>(a.sortOrder||a.addedAt)-(b.sortOrder||b.addedAt));
+    if(!this.items.length){APP.toast('אין פריטים ברשימה');return;}
+    this.on=true; this.idx=0;
+    document.getElementById('sb').style.display='flex';
+    if(speechSynthesis.getVoices().length===0)
+      await new Promise(r=>{speechSynthesis.onvoiceschanged=r;setTimeout(r,1000);});
+    await this.readCurrent();
+  },
+
+  setUI(title,sub){
+    document.getElementById('si').textContent=title||'';
+    document.getElementById('ss').textContent=sub||'';
+  },
+
+  async readCurrent(){
+    if(!this.on)return;
+    if(this.idx>=this.items.length){
+      this.setUI('✅ סיימנו!','');
+      await this.speak('סיימנו! כל הכבוד!');
+      this.stop(); return;
+    }
+    const it=this.items[this.idx];
+    const lbl=it.name+(it.qty>1?` ×${it.qty}`:'');
+    this.setUI(lbl,'🔊 מקריא...');
+    await this.speak(it.name+(it.qty>1?`, כמות ${it.qty}`:''));
+    if(!this.on)return;
+    this.setUI(lbl,'🎙️ לחץ לקחתי / דלג — או דבר');
+    this.tryListen();
+  },
+
+  tryListen(){
+    if(!this.on)return;
+    const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+    if(!SR)return; // buttons still work
+    if(this.rec){try{this.rec.abort();}catch(e){}}
+    const r=new SR(); this.rec=r;
+    r.lang='he-IL'; r.interimResults=false; r.maxAlternatives=5;
+    r.onresult=async e=>{
+      if(!this.on)return;
+      const txt=[...e.results[0]].map(x=>x.transcript).join(' ');
+      this.setUI(this.items[this.idx]?.name||'','💬 שמעתי: '+txt);
+      if(/לקח|אחד|כן|יש|אוק|בסד|יאל|טוב|אישור/.test(txt)){
+        await this.take();
+      }else if(/דלג|הבא|לא|אין|פסח|skip/.test(txt)){
+        await this.skip();
+      }else{
+        setTimeout(()=>{if(this.on)this.tryListen();},400);
+      }
+    };
+    r.onerror=e=>{if(!this.on)return;if(e.error==='no-speech'||e.error==='aborted'){if(this.on)setTimeout(()=>this.tryListen(),300);return;}};
+    try{r.start();}catch(e){}
+  },
+
+  async take(){
+    if(!this.on||this.idx>=this.items.length)return;
+    if(this.rec){try{this.rec.abort();}catch(e){} this.rec=null;}
+    await APP.toggleDone(APP.cw,this.items[this.idx].id);
+    this.idx++; await this.readCurrent();
+  },
+  async skip(){
+    if(!this.on)return;
+    if(this.rec){try{this.rec.abort();}catch(e){} this.rec=null;}
+    this.idx++; await this.readCurrent();
+  },
+  stop(){
+    this.on=false; speechSynthesis.cancel();
+    if(this.rec){try{this.rec.abort();}catch(e){} this.rec=null;}
+    document.getElementById('sb').style.display='none';
+  }
+};
+
+/* ─────────────────────────────
+   APP
+───────────────────────────── */
+window.APP={
+  db:null, cw:null, items:{}, stats:{},
+
+  async init(){
+    this.cw=wKey();
+    try{
+      const app=initializeApp(FB); this.db=getDatabase(app);
+      onValue(ref(this.db,'/'),s=>{const d=s.val()||{};this.items=d.items||{};this.stats=d.stats||{};this.saveL();this.render();this.renderWk();this.renderStats();this.checkSugg();});
+      document.getElementById('sync').textContent='☁️ מסונכרן';
+      document.getElementById('sync').className='sync on';
+    }catch(e){
+      this.loadL();
+      document.getElementById('sync').textContent='💾 מקומי';
+      document.getElementById('sync').className='sync off';
+    }
+    this.renderWk();
+  },
+
+  loadL(){try{const d=JSON.parse(localStorage.getItem('hasal')||'{}');this.items=d.items||{};this.stats=d.stats||{};}catch(e){}this.render();this.renderStats();this.checkSugg();},
+  saveL(){localStorage.setItem('hasal',JSON.stringify({items:this.items,stats:this.stats}));},
+  async save(){if(this.db)await set(ref(this.db,'/'),{items:this.items,stats:this.stats});else{this.saveL();this.render();this.renderStats();this.checkSugg();}},
+
+  async addItem(name,img,qty,wk){
+    if(!name||!name.trim())return;
+    wk=wk||this.cw; if(!this.items[wk])this.items[wk]={};
+    const id='i'+Date.now()+Math.random().toString(36).slice(2,4);
+    const vs=Object.values(this.items[wk]);
+    const ms=vs.length?Math.max(...vs.map(x=>x.sortOrder||0)):0;
+    this.items[wk][id]={id,name:name.trim(),qty:parseInt(qty)||1,done:false,price:null,image:img||null,addedAt:Date.now(),sortOrder:ms+1000,autoAdded:false};
+    const k=name.trim().toLowerCase();
+    if(!this.stats[k])this.stats[k]={count:0,weeks:[],lastAdded:null};
+    if(!this.stats[k].weeks.includes(wk))this.stats[k].weeks.push(wk);
+    this.stats[k].count++;this.stats[k].lastAdded=Date.now();
+    await this.save();
+    document.getElementById('inp').value='';
+    document.getElementById('qi').value='';
+    clearImgPreview();
+  },
+
+  async toggleDone(wk,id){const it=this.items[wk]?.[id];if(!it)return;it.done=!it.done;await this.save();},
+  async setPrice(wk,id,v){if(this.items[wk]?.[id]){this.items[wk][id].price=parseFloat(v)||null;await this.save();}},
+  async doEdit(wk,id,name,qty){if(this.items[wk]?.[id]&&name.trim()){this.items[wk][id].name=name.trim();this.items[wk][id].qty=parseInt(qty)||1;await this.save();}},
+
+  async moveNext(wk,id){
+    const it=this.items[wk]?.[id];if(!it)return;
+    const d=new Date();d.setDate(d.getDate()+7);const nw=wKey(d);
+    if(!this.items[nw])this.items[nw]={};
+    const nid='i'+Date.now();const vs=Object.values(this.items[nw]);
+    const ms=vs.length?Math.max(...vs.map(x=>x.sortOrder||0)):0;
+    this.items[nw][nid]={...it,id:nid,done:false,price:null,addedAt:Date.now(),sortOrder:ms+1000};
+    delete this.items[wk][id];await this.save();this.toast('📅 הועבר לשבוע הבא!');
+  },
+  async del(wk,id){if(this.items[wk]?.[id]){delete this.items[wk][id];await this.save();}},
+
+  render(){
+    const wk=this.cw;
+    document.getElementById('wl').textContent=wLabel(wk);
+    const arr=Object.values(this.items[wk]||{}).sort((a,b)=>(a.sortOrder||a.addedAt)-(b.sortOrder||b.addedAt));
+    const pen=arr.filter(i=>!i.done),dn=arr.filter(i=>i.done);
+    const tot=dn.reduce((s,i)=>s+(i.price||0),0);
+    document.getElementById('tot').textContent=tot>0?`סה״כ: ₪${tot.toFixed(2)}`:'';
+    document.getElementById('cnt').textContent=`${pen.length} פריטים`;
+    const L=document.getElementById('list');L.innerHTML='';
+    if(!arr.length){L.innerHTML='<div class="empty">🛒<p>הרשימה ריקה</p></div>';return;}
+    pen.forEach(it=>L.appendChild(this.mkEl(wk,it)));
+    if(dn.length){const d=document.createElement('div');d.className='dlbl';d.textContent=`✓ נלקח (${dn.length})`;L.appendChild(d);dn.forEach(it=>L.appendChild(this.mkEl(wk,it)));}
+  },
+
+  mkEl(wk,it){
+    const w=document.createElement('div');
+    w.className='iw'+(it.done?' iw-done':''); w.dataset.id=it.id;
+    const qb=it.qty>1?`<span class="qb">×${it.qty}</span>`:'';
+    const ab=it.autoAdded?`<span title="הסל הזכור">🤖</span>`:'';
+    const imgSrc=it.image?it.image.replace(/'/g,"&#39;"):'';
+    const im=it.image?`<img src="${imgSrc}" class="ith" onclick="event.stopPropagation();APP.bigImg(this.src)">` :'';
+    w.innerHTML=`
+      <div class="shl">📅 שבוע הבא</div><div class="shr">🗑 מחיקה</div>
+      <div class="ic${it.done?' dn':''}">
+        ${it.done?'':'<div class="dh">↑</div>'}
+        ${im}
+        <div class="itx">
+          <div class="ir"><span class="inm">${it.name}</span>${qb}${ab}</div>
+          ${it.done?'<span class="dck">✓ נלקח</span>':''}
+        </div>
+        <div class="pi"><span class="ps">₪</span><input type="number" class="pf" placeholder="—" value="${it.price||''}" step="0.1" min="0"></div>
+      </div>`;
+
+    const card=w.querySelector('.ic');
+    const hl=w.querySelector('.shl'),hr=w.querySelector('.shr');
+    const pf=w.querySelector('.pf');
+
+    pf.addEventListener('click',e=>e.stopPropagation());
+    pf.addEventListener('touchstart',e=>e.stopPropagation(),{passive:true});
+    pf.addEventListener('change',e=>{e.stopPropagation();APP.setPrice(wk,it.id,e.target.value);});
+
+    // Tap → toggle
+    card.addEventListener('click',e=>{if(e.target.closest('.dh')||e.target.closest('.pf')||e.target.closest('.ith'))return;APP.toggleDone(wk,it.id);});
+
+    // Long press → edit
+    let lpt=null;
+    card.addEventListener('touchstart',e=>{
+      if(e.target.closest('.dh')||e.target.closest('.pf'))return;
+      lpt=setTimeout(()=>{lpt=null;APP.openEdit(wk,it.id);},650);
+    },{passive:true});
+    card.addEventListener('touchend',()=>{if(lpt){clearTimeout(lpt);lpt=null;}});
+    card.addEventListener('touchmove',()=>{if(lpt){clearTimeout(lpt);lpt=null;}});
+    card.addEventListener('contextmenu',e=>{e.preventDefault();APP.openEdit(wk,it.id);});
+
+    // Swipe
+    let sx=0,sw=false;
+    card.addEventListener('touchstart',e=>{if(e.target.closest('.dh')||e.target.closest('.pf'))return;sx=e.touches[0].clientX;sw=true;card.style.transition='none';},{passive:true});
+    card.addEventListener('touchmove',e=>{if(!sw)return;const dx=e.touches[0].clientX-sx;card.style.transform=`translateX(${dx}px)`;hl.style.opacity=dx<-20?Math.min(1,Math.abs(dx)/80):0;hr.style.opacity=dx>20?Math.min(1,dx/80):0;},{passive:true});
+    card.addEventListener('touchend',()=>{
+      if(!sw)return;sw=false;
+      const dx=parseFloat(card.style.transform.replace(/[^-\d.]/g,''))||0;
+      card.style.transition='transform .28s';hl.style.opacity=0;hr.style.opacity=0;
+      if(dx<-80){card.style.transform='translateX(-120%)';setTimeout(()=>APP.moveNext(wk,it.id),240);}
+      else if(dx>80){card.style.transform='translateX(120%)';setTimeout(()=>APP.del(wk,it.id),240);}
+      else card.style.transform='translateX(0)';
+    });
+
+    // Drag handle
+    if(!it.done){
+      const dh=w.querySelector('.dh');
+      dh.addEventListener('touchstart',e=>{e.stopPropagation();if(lpt){clearTimeout(lpt);lpt=null;}DRAG.start(w,e.touches[0].clientY);},{passive:true});
+      dh.addEventListener('mousedown',e=>{e.stopPropagation();DRAG.start(w,e.clientY);});
+    }
+    return w;
+  },
+
+  openEdit(wk,id){
+    const it=this.items[wk]?.[id];if(!it)return;
+    document.getElementById('en').value=it.name;
+    document.getElementById('eq').value=it.qty||1;
+    const m=document.getElementById('em');m.dataset.wk=wk;m.dataset.id=id;m.classList.add('on');
+    setTimeout(()=>document.getElementById('en').focus(),80);
+  },
+  async commitEdit(){
+    const m=document.getElementById('em');
+    await this.doEdit(m.dataset.wk,m.dataset.id,document.getElementById('en').value,document.getElementById('eq').value);
+    m.classList.remove('on');
+  },
+
+  bigImg(src){document.getElementById('bim').src=src;document.getElementById('bm').classList.add('on');},
+
+  renderWk(){
+    const d2=new Date();d2.setDate(d2.getDate()+7);
+    const all=[...new Set([wKey(),wKey(d2),...Object.keys(this.items)])].sort().reverse();
+    const sel=document.getElementById('wks');const cur=this.cw;sel.innerHTML='';
+    all.forEach(k=>{const o=document.createElement('option');o.value=k;o.textContent=wLabel(k);if(k===cur)o.selected=true;sel.appendChild(o);});
+  },
+  switchWeek(k){this.cw=k;this.render();this.checkSugg();},
+
+  checkSugg(){
+    const wk=this.cw;const cur=Object.values(this.items[wk]||{}).map(i=>i.name.toLowerCase());
+    const now=Date.now();const s=[];
+    Object.entries(this.stats).forEach(([n,st])=>{
+      if(st.count<2||cur.includes(n))return;
+      const avg=st.weeks.length>1?(st.weeks.length-1)/(st.count-1):3;
+      const days=(now-(st.lastAdded||0))/86400000;
+      if(days>=avg*7*0.8)s.push({name:n,days:Math.round(avg*7)});
+    });
+    const c=document.getElementById('sugg');
+    if(!s.length){c.style.display='none';return;}
+    c.style.display='block';
+    c.innerHTML='<div class="stit">🤖 הסל הזכור:</div>'+s.slice(0,5).map(x=>`<div class="sc" onclick="APP.addItem('${x.name}',null,1);APP.toast('✅ נוסף!')"><span>${x.name}</span><small>~כל ${x.days} יום</small><span class="sp">+</span></div>`).join('');
+  },
+
+  renderStats(){
+    const c=document.getElementById('stc');
+    const e=Object.entries(this.stats).filter(([,s])=>s.count>=1)
+      .map(([n,s])=>({n,c:s.count,a:s.weeks.length>1?Math.round((s.weeks.length-1)/(s.count-1)*7):'?'}))
+      .sort((a,b)=>b.c-a.c).slice(0,20);
+    if(!e.length){c.innerHTML='<p style="color:var(--t2);padding:18px 0">עדיין אין נתונים 📊</p>';return;}
+    c.innerHTML='<div class="shdr"><span>מוצר</span><span>ממוצע</span><span>פעמים</span></div>'+
+      e.map(x=>`<div class="sr"><span class="sn">${x.n}</span><span class="sa">${x.a==='?'?'—':`~${x.a} יום`}</span><span class="sc2">${x.c}×</span></div>`).join('');
+  },
+
+  cmp(){
+    const w1=+document.getElementById('w1').value,p1=+document.getElementById('p1').value;
+    const w2=+document.getElementById('w2').value,p2=+document.getElementById('p2').value;
+    if(!w1||!p1||!w2||!p2){this.toast('⚠️ מלא את כל השדות');return;}
+    const u1=p1/w1,u2=p2/w2,r=document.getElementById('cr');
+    if(u1<u2){const pct=(((u2-u1)/u2)*100).toFixed(1);r.innerHTML=`<div class="cw">🏆 מוצר א׳ זול ב-<strong>${pct}%</strong></div><div class="cd">₪${u1.toFixed(3)} ליח׳ לעומת ₪${u2.toFixed(3)} ליח׳</div>`;}
+    else if(u2<u1){const pct=(((u1-u2)/u1)*100).toFixed(1);r.innerHTML=`<div class="cw">🏆 מוצר ב׳ זול ב-<strong>${pct}%</strong></div><div class="cd">₪${u2.toFixed(3)} ליח׳ לעומת ₪${u1.toFixed(3)} ליח׳</div>`;}
+    else r.innerHTML='<div class="cw">🤝 זהים!</div>';
+  },
+
+  toast(m){const t=document.getElementById('toast');t.textContent=m;t.className='toast on';setTimeout(()=>t.className='toast',2500);}
+};
+window.addEventListener('DOMContentLoaded',()=>APP.init());
+</script>
+
+<style>
+:root{--bg:#0f1117;--s:#1a1d27;--s2:#22263a;--g:#4ade80;--b:#38bdf8;--rd:#f87171;--t:#f1f5f9;--t2:#94a3b8;--bd:#2d3249;--r:16px;}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent;}
+body{font-family:'Rubik',sans-serif;background:var(--bg);color:var(--t);min-height:100vh;direction:rtl;}
+.hdr{background:var(--s);border-bottom:1px solid var(--bd);padding:12px 14px 10px;position:sticky;top:0;z-index:100;}
+.htop{display:flex;align-items:center;justify-content:space-between;margin-bottom:9px;}
+.logo{font-size:1.35rem;font-weight:900;}.logo span{color:var(--g);}
+.sync{font-size:.68rem;padding:3px 8px;border-radius:20px;}
+.sync.on{background:rgba(74,222,128,.15);color:var(--g);}.sync.off{background:rgba(148,163,184,.15);color:var(--t2);}
+.wkbar{display:flex;align-items:center;gap:8px;}
+#wks{background:var(--s2);color:var(--t);border:1px solid var(--bd);border-radius:8px;padding:5px 9px;font-family:inherit;font-size:.78rem;flex:1;}
+#sb{display:none;align-items:center;gap:8px;background:#061206;border-bottom:2px solid var(--g);padding:10px 14px;flex-wrap:wrap;}
+.sbi{flex:1;min-width:110px;}
+.sbl{font-size:.6rem;color:var(--g);font-weight:700;letter-spacing:1px;text-transform:uppercase;}
+#si{font-size:.95rem;font-weight:700;margin-top:2px;}
+#ss{font-size:.68rem;color:var(--t2);margin-top:1px;}
+.sb-btns{display:flex;gap:6px;flex-shrink:0;}
+.sb-take{background:var(--g);color:#000;border:none;border-radius:9px;padding:8px 13px;font-family:inherit;font-weight:700;cursor:pointer;font-size:.85rem;}
+.sb-skip{background:var(--s2);color:var(--t);border:1px solid var(--bd);border-radius:9px;padding:8px 11px;font-family:inherit;cursor:pointer;font-size:.82rem;}
+.sb-stop{background:var(--rd);color:#fff;border:none;border-radius:9px;padding:8px 11px;font-family:inherit;font-weight:700;cursor:pointer;font-size:.82rem;}
+.tabs{display:flex;border-bottom:1px solid var(--bd);background:var(--s);}
+.tab{flex:1;padding:10px;text-align:center;font-size:.77rem;cursor:pointer;border-bottom:2px solid transparent;color:var(--t2);font-weight:500;}
+.tab.active{color:var(--g);border-bottom-color:var(--g);}
+.panel{display:none;padding:13px;max-width:600px;margin:0 auto;}.panel.active{display:block;}
+.abar{display:flex;gap:7px;background:var(--s);border:1px solid var(--bd);border-radius:var(--r);padding:8px;align-items:center;margin-bottom:7px;}
+.abar input[type=text]{flex:1;background:transparent;border:none;color:var(--t);font-family:inherit;font-size:.97rem;outline:none;}
+.abar input::placeholder{color:var(--t2);}
+.icobtn{background:none;border:none;cursor:pointer;font-size:1.2rem;padding:3px 5px;border-radius:8px;flex-shrink:0;}
+.abtn{background:var(--g);color:#000;border:none;cursor:pointer;border-radius:10px;padding:8px 13px;font-weight:700;font-size:.88rem;font-family:inherit;}
+.qrow{display:flex;align-items:center;gap:8px;margin-bottom:9px;}
+.qrow label{font-size:.75rem;color:var(--t2);margin:0;}
+.qrow input{background:var(--s2);border:1px solid var(--bd);color:var(--t);border-radius:8px;padding:5px 9px;font-family:inherit;font-size:.88rem;width:58px;text-align:center;outline:none;}
+#ip{display:none;position:relative;width:fit-content;margin-bottom:8px;}
+#ip img{width:64px;height:64px;object-fit:cover;border-radius:9px;border:2px solid var(--g);}
+#ip button{position:absolute;top:-5px;left:-5px;background:var(--rd);color:#fff;border:none;border-radius:50%;width:19px;height:19px;cursor:pointer;font-size:.72rem;display:flex;align-items:center;justify-content:center;}
+.shopbtn{width:100%;background:transparent;border:1px solid var(--g);color:var(--g);border-radius:var(--r);padding:11px;font-family:inherit;font-weight:700;font-size:.92rem;cursor:pointer;margin-bottom:12px;display:flex;align-items:center;justify-content:center;gap:8px;}
+#sugg{display:none;margin-bottom:11px;}
+.stit{font-size:.72rem;color:var(--t2);margin-bottom:6px;}
+.sc{display:inline-flex;align-items:center;gap:5px;background:var(--s2);border:1px solid var(--bd);border-radius:20px;padding:5px 9px;margin:3px;cursor:pointer;font-size:.77rem;}
+.sp{background:var(--g);color:#000;border-radius:50%;width:17px;height:17px;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:.72rem;flex-shrink:0;}
+.meta{display:flex;justify-content:space-between;margin-bottom:9px;}
+#cnt{font-size:.76rem;color:var(--t2);}#tot{font-size:.86rem;color:var(--g);font-weight:700;}
+.iw{position:relative;margin-bottom:7px;overflow:hidden;border-radius:var(--r);}
+.shl,.shr{position:absolute;top:0;bottom:0;display:flex;align-items:center;padding:0 16px;font-size:.78rem;font-weight:700;opacity:0;pointer-events:none;z-index:0;border-radius:var(--r);}
+.shl{right:0;background:linear-gradient(to left,rgba(56,189,248,.3),transparent);color:var(--b);}
+.shr{left:0;background:linear-gradient(to right,rgba(248,113,113,.3),transparent);color:var(--rd);}
+.ic{position:relative;z-index:1;display:flex;align-items:center;gap:8px;background:var(--s);border:1px solid var(--bd);border-radius:var(--r);padding:10px;cursor:pointer;animation:si .18s ease;}
+@keyframes si{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
+.ic.dn{opacity:.46;}
+.iw.dragging .ic{border-color:var(--g);opacity:.82;box-shadow:0 4px 20px rgba(0,0,0,.5);z-index:10;position:relative;}
+.iw.drag-tgt .ic{border-color:rgba(74,222,128,.5);background:rgba(74,222,128,.07);}
+.dh{font-size:1.15rem;color:var(--t2);cursor:grab;padding:2px 5px;flex-shrink:0;touch-action:none;user-select:none;}
+.dh:active{color:var(--g);}
+.ith{width:38px;height:38px;object-fit:cover;border-radius:7px;flex-shrink:0;}
+.itx{flex:1;min-width:0;}
+.ir{display:flex;align-items:center;gap:5px;flex-wrap:wrap;}
+.inm{font-size:.92rem;font-weight:500;}
+.ic.dn .inm{text-decoration:line-through;color:var(--t2);}
+.dck{font-size:.7rem;color:var(--g);font-weight:700;display:block;margin-top:2px;}
+.qb{background:var(--b);color:#000;border-radius:9px;padding:1px 6px;font-size:.7rem;font-weight:700;flex-shrink:0;}
+.pi{display:flex;align-items:center;gap:2px;flex-shrink:0;}
+.ps{font-size:.7rem;color:var(--t2);}
+.pf{width:52px;background:var(--s2);border:1px solid var(--bd);color:var(--g);border-radius:7px;padding:3px 4px;font-family:inherit;font-size:.78rem;font-weight:700;text-align:center;outline:none;}
+.pf:focus{border-color:var(--g);}
+.dlbl{font-size:.73rem;color:var(--t2);padding:7px 3px 3px;}
+.empty{text-align:center;padding:36px 20px;color:var(--t2);font-size:.9rem;}.empty p{margin-top:8px;}
+.shdr{display:flex;gap:8px;font-size:.67rem;color:var(--t2);font-weight:700;padding-bottom:5px;border-bottom:1px solid var(--bd);margin-bottom:7px;}
+.shdr span:first-child{flex:1;}
+.sr{display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid rgba(45,50,73,.5);}
+.sn{flex:1;font-size:.83rem;}.sa{font-size:.73rem;color:var(--t2);min-width:75px;}.sc2{font-size:.78rem;color:var(--g);font-weight:700;min-width:28px;text-align:left;}
+.cgrid{display:grid;grid-template-columns:1fr 1fr;gap:11px;margin-bottom:13px;}
+.cc{background:var(--s2);border-radius:11px;padding:13px;}
+.cct{font-size:.73rem;color:var(--t2);margin-bottom:9px;font-weight:700;}
+.cc input{width:100%;background:var(--s);border:1px solid var(--bd);color:var(--t);border-radius:8px;padding:7px 9px;font-family:inherit;font-size:.88rem;margin-bottom:7px;direction:rtl;outline:none;}
+.cbtn{width:100%;background:var(--b);color:#000;border:none;border-radius:10px;padding:10px;font-weight:700;font-size:.92rem;cursor:pointer;font-family:inherit;margin-bottom:13px;}
+.cw{font-size:1.05rem;font-weight:700;text-align:center;margin-bottom:5px;}.cd{font-size:.78rem;color:var(--t2);text-align:center;}
+.mo{position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:1000;display:none;align-items:center;justify-content:center;backdrop-filter:blur(4px);padding:18px;}
+.mo.on{display:flex;}
+.mb{background:var(--s);border:1px solid var(--bd);border-radius:19px;padding:20px;width:100%;max-width:340px;animation:pop .2s ease;}
+@keyframes pop{from{transform:scale(.9);opacity:0}to{transform:scale(1);opacity:1}}
+.mb h3{font-size:.97rem;margin-bottom:13px;}
+.mi{width:100%;background:var(--s2);border:1px solid var(--bd);color:var(--t);border-radius:9px;padding:9px 13px;font-family:inherit;font-size:.97rem;margin-bottom:9px;direction:rtl;outline:none;}
+.mi:focus{border-color:var(--g);}
+.mbtns{display:flex;gap:8px;}
+.bp{flex:1;background:var(--g);color:#000;border:none;border-radius:9px;padding:10px;font-weight:700;cursor:pointer;font-family:inherit;}
+.bs{flex:1;background:var(--s2);color:var(--t);border:1px solid var(--bd);border-radius:9px;padding:10px;cursor:pointer;font-family:inherit;}
+/* Sheet */
+.sheet{position:fixed;inset:0;background:rgba(0,0,0,.72);z-index:1100;display:none;align-items:flex-end;justify-content:center;}
+.sheet.on{display:flex;}
+.shbody{background:var(--s);border-radius:20px 20px 0 0;padding:18px 16px 28px;width:100%;max-width:500px;}
+.shtit{font-size:.76rem;color:var(--t2);text-align:center;margin-bottom:13px;}
+.shopts{display:flex;flex-direction:column;gap:8px;margin-bottom:8px;}
+.sopt{background:var(--s2);border:1px solid var(--bd);color:var(--t);border-radius:12px;padding:13px 14px;font-family:inherit;font-size:.93rem;cursor:pointer;display:flex;align-items:center;gap:10px;font-weight:500;width:100%;text-align:right;}
+.sopt:active{border-color:var(--g);}
+.shcancel{width:100%;background:transparent;border:1px solid var(--bd);color:var(--t2);border-radius:12px;padding:11px;font-family:inherit;font-size:.9rem;cursor:pointer;margin-top:4px;}
+/* Search panel inside sheet */
+.srchpanel{display:none;margin-top:12px;border-top:1px solid var(--bd);padding-top:12px;}
+.srchpanel.on{display:block;}
+.srchbar{display:flex;gap:7px;margin-bottom:8px;}
+.srchbar input{flex:1;background:var(--s2);border:1px solid var(--bd);color:var(--t);border-radius:9px;padding:8px 11px;font-family:inherit;font-size:.9rem;outline:none;direction:rtl;}
+.srchbar input:focus{border-color:var(--b);}
+.srchbar button{background:var(--b);color:#000;border:none;border-radius:9px;padding:8px 13px;font-weight:700;cursor:pointer;font-family:inherit;font-size:.85rem;}
+.igrid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;max-height:230px;overflow-y:auto;margin-bottom:8px;}
+.igrid img{width:100%;aspect-ratio:1;object-fit:cover;border-radius:8px;cursor:pointer;border:2px solid transparent;display:block;}
+.igrid img.sel{border-color:var(--g);}
+.ige{grid-column:1/-1;text-align:center;color:var(--t2);padding:16px;font-size:.82rem;}
+#bim{max-width:100%;max-height:70vh;object-fit:contain;border-radius:11px;display:block;margin:0 auto;}
+.toast{position:fixed;bottom:65px;left:50%;transform:translateX(-50%) translateY(16px);background:var(--s);border:1px solid var(--bd);padding:9px 18px;border-radius:19px;font-size:.85rem;opacity:0;transition:all .28s;z-index:3000;pointer-events:none;white-space:nowrap;}
+.toast.on{opacity:1;transform:translateX(-50%) translateY(0);}
+label{font-size:.76rem;color:var(--t2);display:block;margin-bottom:3px;}
+@media(max-width:400px){.cgrid{grid-template-columns:1fr;}}
+</style>
+</head>
+<body>
+
+<!-- Hidden file inputs — triggered programmatically to avoid double sheet -->
+<input type="file" id="fi-gal" accept="image/*" style="display:none" onchange="handleFile(event)">
+<input type="file" id="fi-cam" accept="image/*" capture="environment" style="display:none" onchange="handleFile(event)">
+
+<div class="hdr">
+  <div class="htop">
+    <div class="logo">🛒 הסל <span>שלנו</span></div>
+    <span id="sync" class="sync off">טוען...</span>
+  </div>
+  <div class="wkbar">
+    <select id="wks" onchange="APP.switchWeek(this.value)"></select>
+    <span id="wl" style="font-size:.7rem;color:var(--t2);white-space:nowrap"></span>
+  </div>
+</div>
+
+<!-- SHOP BAR -->
+<div id="sb">
+  <div class="sbi">
+    <div class="sbl">🛒 קניה קולית</div>
+    <div id="si">...</div>
+    <div id="ss"></div>
+  </div>
+  <div class="sb-btns">
+    <button class="sb-take" onclick="SHOP.take()">✓ לקחתי</button>
+    <button class="sb-skip" onclick="SHOP.skip()">דלג ▶</button>
+    <button class="sb-stop" onclick="SHOP.stop()">✕</button>
+  </div>
+</div>
+
+<div class="tabs">
+  <div class="tab active" onclick="sTab('list',this)">🛒 רשימה</div>
+  <div class="tab" onclick="sTab('stats',this)">📊 סטטיסטיקות</div>
+  <div class="tab" onclick="sTab('compare',this)">⚖️ השוואה</div>
+</div>
+
+<!-- LIST -->
+<div id="list-panel" class="panel active">
+  <div id="ip"><img id="pi" src="" alt=""><button onclick="clearImgPreview()">✕</button></div>
+  <div class="abar">
+    <input type="text" id="inp" placeholder="מוצר חדש..." onkeydown="if(event.key==='Enter')doAdd()">
+    <button class="icobtn" onclick="openSheet()">📷</button>
+    <button class="abtn" onclick="doAdd()">הוסף</button>
+  </div>
+  <div class="qrow">
+    <label style="margin:0">כמות:</label>
+    <input type="number" id="qi" placeholder="1" min="1" max="99">
+  </div>
+  <button class="shopbtn" onclick="SHOP.start()">🎙️ התחל קניה קולית</button>
+  <div id="sugg"></div>
+  <div class="meta"><span id="cnt"></span><span id="tot"></span></div>
+  <div id="list"></div>
+</div>
+
+<!-- STATS -->
+<div id="stats-panel" class="panel">
+  <p style="font-size:.95rem;font-weight:700;margin-bottom:5px">📊 דפוסי הקנייה שלי</p>
+  <p style="font-size:.75rem;color:var(--t2);margin-bottom:12px">הסל לומד מתי קונים כל מוצר</p>
+  <div id="stc"></div>
+</div>
+
+<!-- COMPARE -->
+<div id="compare-panel" class="panel">
+  <p style="font-size:.95rem;font-weight:700;margin-bottom:12px">⚖️ מה יותר משתלם?</p>
+  <div class="cgrid">
+    <div class="cc"><div class="cct">מוצר א׳</div><label>משקל/נפח</label><input type="number" id="w1" placeholder="500"><label>מחיר ₪</label><input type="number" id="p1" placeholder="12.90"></div>
+    <div class="cc"><div class="cct">מוצר ב׳</div><label>משקל/נפח</label><input type="number" id="w2" placeholder="1000"><label>מחיר ₪</label><input type="number" id="p2" placeholder="19.90"></div>
+  </div>
+  <button class="cbtn" onclick="APP.cmp()">השווה 🔍</button>
+  <div id="cr"></div>
+</div>
+
+<!-- EDIT MODAL -->
+<div class="mo" id="em" onclick="if(event.target===this)this.classList.remove('on')">
+  <div class="mb">
+    <h3>✏️ עריכת מוצר</h3>
+    <input class="mi" type="text" id="en" placeholder="שם מוצר" onkeydown="if(event.key==='Enter')APP.commitEdit()">
+    <label>כמות</label>
+    <input class="mi" type="number" id="eq" placeholder="1" min="1" max="99">
+    <div class="mbtns"><button class="bp" onclick="APP.commitEdit()">שמור</button><button class="bs" onclick="document.getElementById('em').classList.remove('on')">ביטול</button></div>
+  </div>
+</div>
+
+<!-- IMAGE SHEET -->
+<div class="sheet" id="img-sheet" onclick="if(event.target===this)closeSheet()">
+  <div class="shbody">
+    <div class="shtit">הוסף תמונה למוצר</div>
+    <div class="shopts">
+      <button class="sopt" onclick="document.getElementById('fi-gal').click()">📁 בחר מהגלריה</button>
+      <button class="sopt" onclick="document.getElementById('fi-cam').click()">📸 צלם עכשיו</button>
+      <button class="sopt" onclick="toggleSearch()">🔍 חפש ברשת</button>
+    </div>
+    <!-- Image search panel -->
+    <div class="srchpanel" id="srchpanel">
+      <div class="srchbar">
+        <input type="text" id="sq" placeholder="שם המוצר..." onkeydown="if(event.key==='Enter')runSearch()">
+        <button onclick="runSearch()">חפש</button>
+      </div>
+      <div class="igrid" id="igrid"><div class="ige">הקלד ולחץ חפש</div></div>
+      <button class="bp" id="pickbtn" style="display:none;width:100%;margin-top:4px" onclick="pickImg()">✅ בחר תמונה זו</button>
+    </div>
+    <button class="shcancel" onclick="closeSheet()">ביטול</button>
+  </div>
+</div>
+
+<!-- BIG IMAGE -->
+<div class="mo" id="bm" onclick="this.classList.remove('on')">
+  <div class="mb" style="background:transparent;border:none;max-width:90vw"><img id="bim" src="" alt=""></div>
+</div>
+<div id="toast" class="toast"></div>
+
+<script>
+window._img = null;
+
+function sTab(n,el){
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+  document.getElementById(n+'-panel').classList.add('active');el.classList.add('active');
+  if(n==='stats')APP.renderStats();
+}
+
+function doAdd(){
+  const name = document.getElementById('inp').value.trim();
+  const qty  = parseInt(document.getElementById('qi').value) || 1;
+  const img  = window._img || null;
+  if(name) APP.addItem(name, img, qty);
+}
+
+function clearImgPreview(){
+  window._img = null;
+  document.getElementById('ip').style.display = 'none';
+  document.getElementById('pi').src = '';
+}
+
+function setImgPreview(src){
+  window._img = src;
+  document.getElementById('pi').src = src;
+  document.getElementById('ip').style.display = 'block';
+}
+
+// Sheet — NO label/input combos to avoid double native sheet
+function openSheet(){
+  const name = document.getElementById('inp').value.trim();
+  if(name) document.getElementById('sq').value = name;
+  document.getElementById('srchpanel').classList.remove('on');
+  document.getElementById('igrid').innerHTML = '<div class="ige">הקלד ולחץ חפש</div>';
+  document.getElementById('pickbtn').style.display = 'none';
+  window._selUrl = null;
+  document.getElementById('img-sheet').classList.add('on');
+}
+function closeSheet(){ document.getElementById('img-sheet').classList.remove('on'); }
+function toggleSearch(){ document.getElementById('srchpanel').classList.toggle('on'); }
+
+function handleFile(e){
+  const f = e.target.files[0]; if(!f) return;
+  // Reset input so same file can be picked again
+  e.target.value = '';
+  const r = new FileReader();
+  r.onload = ev => { setImgPreview(ev.target.result); closeSheet(); APP.toast('✅ תמונה נבחרה!'); };
+  r.readAsDataURL(f);
+}
+
+// Image search — loremflickr, store URL directly (no fetch/CORS needed)
+window._selUrl = null;
+function runSearch(){
+  const q = document.getElementById('sq').value.trim(); if(!q) return;
+  const grid = document.getElementById('igrid');
+  grid.innerHTML = '<div class="ige">מחפש...</div>';
+  window._selUrl = null;
+  document.getElementById('pickbtn').style.display = 'none';
+  grid.innerHTML = '';
+  // loremflickr: ?lock=N gives consistent different images per seed
+  for(let i=1; i<=9; i++){
+    const img = document.createElement('img');
+    img.src = `https://loremflickr.com/120/120/${encodeURIComponent(q)}?lock=${i}`;
+    img.loading = 'lazy';
+    img.onclick = () => {
+      grid.querySelectorAll('img').forEach(x=>x.classList.remove('sel'));
+      img.classList.add('sel');
+      window._selUrl = img.src;
+      document.getElementById('pickbtn').style.display = 'block';
+    };
+    img.onerror = () => img.style.opacity = '0.2';
+    grid.appendChild(img);
+  }
+}
+
+function pickImg(){
+  if(!window._selUrl) return;
+  // Store the URL directly — works for display, no CORS fetch needed
+  setImgPreview(window._selUrl);
+  closeSheet();
+  APP.toast('✅ תמונה נבחרה!');
+}
+</script>
+</body>
+</html>
